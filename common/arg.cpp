@@ -1688,6 +1688,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--seq-compact"},
+        {"--no-seq-compact"},
+        "with a non-unified KV cache, keep busy slots on contiguous sequence ids by migrating a busy sequence into an idle slot's sequence, so that they decode in one ubatch (default: enabled; the idle slot's context moves to the prompt cache, without one it is kept and no migration happens)",
+        [](common_params & params, bool value) {
+            params.seq_compact = value;
+        }
+    ).set_env("LLAMA_ARG_SEQ_COMPACT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
