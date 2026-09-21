@@ -2249,6 +2249,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
+    // GGML_SCHED_N_COPIES=<n>: number of input copies (pipeline depth) when parallel, 1..GGML_SCHED_MAX_COPIES;
+    // fewer copies need less compute-buffer memory (each graph input is allocated n_copies times)
+    if (parallel && getenv("GGML_SCHED_N_COPIES")) {
+        const int n = atoi(getenv("GGML_SCHED_N_COPIES"));
+        if (n >= 1 && n <= GGML_SCHED_MAX_COPIES) {
+            sched->n_copies = n;
+        }
+    }
+
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
