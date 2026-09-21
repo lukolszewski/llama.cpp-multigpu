@@ -638,6 +638,9 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
+    int32_t prefill_max_partial = 1;     // max slots prefilling within one batch (1 = first come first served)
+    int32_t prefill_long_threshold = 8192; // a prompt with more remaining tokens than this is "long"
+    int32_t prefill_max_long    = 1;     // max long prompts prefilling concurrently
     bool    seq_compact         = true;  // keep busy sequences contiguous by migrating them into idle gaps
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset

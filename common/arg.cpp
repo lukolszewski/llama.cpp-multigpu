@@ -1688,6 +1688,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefill-max-partial"}, "N",
+        string_format("max number of slots that may prefill within one batch; 1 = the first slot takes the whole batch, others wait (default: %d)", params.prefill_max_partial),
+        [](common_params & params, int value) {
+            params.prefill_max_partial = std::max(1, value);
+        }
+    ).set_env("LLAMA_ARG_PREFILL_MAX_PARTIAL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-long-threshold"}, "N",
+        string_format("a prompt with more than N tokens left to prefill counts as long for --prefill-max-long (default: %d)", params.prefill_long_threshold),
+        [](common_params & params, int value) {
+            params.prefill_long_threshold = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_PREFILL_LONG_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-max-long"}, "N",
+        string_format("max number of long prompts prefilling concurrently; further long prompts wait in arrival order (default: %d)", params.prefill_max_long),
+        [](common_params & params, int value) {
+            params.prefill_max_long = std::max(1, value);
+        }
+    ).set_env("LLAMA_ARG_PREFILL_MAX_LONG").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--seq-compact"},
         {"--no-seq-compact"},
         "with a non-unified KV cache, keep busy slots on contiguous sequence ids by migrating a busy sequence into an idle slot's sequence, so that they decode in one ubatch (default: enabled; the idle slot's context moves to the prompt cache, without one it is kept and no migration happens)",

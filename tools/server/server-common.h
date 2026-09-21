@@ -414,6 +414,9 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // time spent waiting for prefill admission (us), before t_start
+    int64_t t_prefill_wait = 0;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;
@@ -446,6 +449,10 @@ struct server_slot_stats {
             return 0.0; // the prompt is not processed yet
         }
         return (t_prompt_last - t_start) / 1000.0;
+    }
+
+    double t_prefill_wait_ms() const {
+        return t_prefill_wait / 1000.0;
     }
     int64_t t_gen_us() const {
         if (t_gen_last == 0) {
@@ -522,6 +529,12 @@ struct server_metrics {
 
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
+
+    // prefill admission (see server_context::update_slots)
+    uint64_t n_prefill_wait_us          = 0; // time prompts spent waiting for admission
+    uint64_t n_prefill_admissions       = 0; // prompts that started processing
+    uint64_t n_prefill_admissions_short = 0; // of which classified short at admission
+    uint64_t n_prefill_batches_shared   = 0; // batches carrying 2+ prefilling slots
 
     uint64_t n_tokens_max = 0;
 

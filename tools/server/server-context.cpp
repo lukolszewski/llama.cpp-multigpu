@@ -345,6 +345,12 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // prefill admission (see server_context::update_slots), valid while the prompt is processed
+    bool    prefill_admitted    = false; // may add prompt tokens to the current batch
+    bool    prefill_waiting     = false; // has prompt tokens left but was not admitted
+    bool    prefill_is_long     = false; // classification at the last admission decision
+    int64_t t_prefill_wait_last = 0;     // when the current wait was last accounted, 0 = not waiting
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -454,6 +460,11 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+
+        prefill_admitted    = false;
+        prefill_waiting     = false;
+        prefill_is_long     = false;
+        t_prefill_wait_last = 0;
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -672,6 +683,9 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
+            prefill_admitted = false;
+            prefill_waiting  = false;
+
             // do not keep context of the child slots - the parent's context is enough
             // nor of the stateless slots - no task ever reuses it
             if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -832,6 +846,8 @@ struct server_slot {
             res["n_prompt_tokens"]           = (int32_t) prompt.tokens.size();
             res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
             res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
+            res["prefill_waiting"]           = prefill_waiting;
+            res["prefill_wait_ms"]           = stats.t_prefill_wait_ms();
             res["params"] = ptask->params.to_json(only_metrics);
             res["next_token"] = json::array({
                 {
@@ -3184,10 +3200,22 @@ private:
             case SERVER_TASK_TYPE_METRICS:
                 {
                     int n_processing_slots = 0;
+                    int n_prefilling_slots = 0;
+                    int n_prefill_waiting_slots = 0;
+                    int n_generating_slots = 0;
 
                     for (server_slot & slot : slots) {
                         if (slot.is_processing()) {
                             n_processing_slots++;
+                        }
+                        if (slot.is_processing() && slot.prefill_admitted) {
+                            n_prefilling_slots++;
+                        }
+                        if (slot.is_processing() && slot.prefill_waiting) {
+                            n_prefill_waiting_slots++;
+                        }
+                        if (slot.state == SLOT_STATE_GENERATING) {
+                            n_generating_slots++;
                         }
                     }
                     SRV_DBG("n_processing_slots = %d\n", n_processing_slots);
@@ -3196,6 +3224,9 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    res->n_prefilling_slots  = n_prefilling_slots;
+                    res->n_prefill_waiting_slots = n_prefill_waiting_slots;
+                    res->n_generating_slots  = n_generating_slots;
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -3655,6 +3686,108 @@ private:
         }
     }
 
+    // Decide which slots may add prompt tokens to the next batch (see the call site in
+    // update_slots) and account waiting time. Returns the per-slot share of the given budget.
+    int32_t prefill_admit(int32_t n_budget) {
+        struct cand_t {
+            server_slot * slot;
+            int32_t remaining;
+        };
+
+        std::vector<cand_t> cands;
+
+        for (auto & slot : slots) {
+            if (!slot.is_processing() || !slot.task) {
+                continue;
+            }
+
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_STARTED) {
+                continue;
+            }
+
+            int32_t remaining = 0;
+
+            if (slot.state == SLOT_STATE_STARTED) {
+                // the reusable prefix is only known once the slot starts; estimate it the same way
+                remaining = slot.task->n_tokens();
+                if (slot.task->params.cache_prompt) {
+                    remaining -= (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                }
+            } else {
+                remaining = slot.task->n_tokens() - slot.prompt.n_tokens();
+            }
+
+            cands.push_back({ &slot, std::max(0, remaining) });
+        }
+
+        if (cands.empty()) {
+            return n_budget;
+        }
+
+        // arrival order
+        std::sort(cands.begin(), cands.end(), [](const cand_t & a, const cand_t & b) {
+            return a.slot->task->id < b.slot->task->id;
+        });
+
+        const int64_t t_now = ggml_time_us();
+
+        int32_t n_admitted = 0;
+        int32_t n_long     = 0;
+
+        for (auto & c : cands) {
+            auto & slot = *c.slot;
+
+            const bool is_long = c.remaining > params_base.prefill_long_threshold;
+
+            bool admit = n_admitted < params_base.prefill_max_partial;
+            if (admit && is_long && n_long >= params_base.prefill_max_long) {
+                admit = false;
+            }
+
+            if (admit) {
+                n_admitted++;
+                if (is_long) {
+                    n_long++;
+                }
+            }
+
+            if (admit != slot.prefill_admitted || is_long != slot.prefill_is_long) {
+                if (admit) {
+                    SLT_INF(slot, "prefill admitted: %s, %d tokens left, %d slot(s) prefilling\n",
+                            is_long ? "long" : "short", c.remaining, n_admitted);
+                } else {
+                    SLT_INF(slot, "prefill waiting: %s, %d tokens left, %d slot(s) ahead (long %d/%d)\n",
+                            is_long ? "long" : "short", c.remaining, n_admitted, n_long, params_base.prefill_max_long);
+                }
+            }
+
+            // waiting time accounting
+            if (!admit) {
+                if (slot.t_prefill_wait_last != 0) {
+                    slot.stats.t_prefill_wait += t_now - slot.t_prefill_wait_last;
+                }
+                slot.t_prefill_wait_last = t_now;
+            } else if (slot.t_prefill_wait_last != 0) {
+                slot.stats.t_prefill_wait += t_now - slot.t_prefill_wait_last;
+                slot.t_prefill_wait_last = 0;
+            }
+
+            slot.prefill_admitted = admit;
+            slot.prefill_waiting  = !admit;
+            slot.prefill_is_long  = is_long;
+        }
+
+        if (n_admitted >= 2) {
+            metrics.n_prefill_batches_shared++;
+        }
+
+        if (n_admitted == 0) {
+            return n_budget;
+        }
+
+        return (n_budget + n_admitted - 1) / n_admitted;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -4100,6 +4233,15 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            // prefill admission: decide which of the slots with a prompt to process may add
+            // tokens to this batch. Candidates are taken in arrival order (task id). At most
+            // prefill_max_partial slots are admitted, of which at most prefill_max_long "long"
+            // ones (more than prefill_long_threshold tokens left); the rest wait. The admitted
+            // slots share the remaining batch equally, unused share flows to the next one.
+            // With the defaults (1 / 1) this is exactly first come first served: the first
+            // slot takes the whole batch, as before.
+            const int32_t n_batch_share = prefill_admit(n_batch - batch.size());
+
             iterate(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
@@ -4127,6 +4269,10 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    if (!slot.prefill_admitted) {
+                        return; // waits for admission, see prefill_admit()
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -4135,6 +4281,11 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+
+                        metrics.n_prefill_admissions++;
+                        if (!slot.prefill_is_long) {
+                            metrics.n_prefill_admissions_short++;
+                        }
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -4581,8 +4732,10 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
-                    // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // add prompt tokens for processing in the current batch (at most this slot's share)
+                    const int32_t n_batch_slot = std::min<int32_t>(n_batch, n_tokens_prev + n_batch_share);
+
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4665,6 +4818,9 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+
+                        slot.prefill_admitted = false;
+                        metrics.n_prefill_wait_us += slot.stats.t_prefill_wait;
 
                         GGML_ASSERT(batch.size() > 0);
 

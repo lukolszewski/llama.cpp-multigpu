@@ -1588,6 +1588,22 @@ std::string server_task_result_metrics::to_metrics() {
             "Total time spent generating tokens",
             metrics.predict.time / 1.e6
         }, {
+            "prefill_wait_seconds_total",
+            "Total time prompts spent waiting for prefill admission",
+            metrics.n_prefill_wait_us / 1.e6
+        }, {
+            "prefill_admissions_total",
+            "Number of prompts admitted to prefill",
+            (double) metrics.n_prefill_admissions
+        }, {
+            "prefill_admissions_short_total",
+            "Number of prompts admitted to prefill that were classified short",
+            (double) metrics.n_prefill_admissions_short
+        }, {
+            "prefill_batches_shared_total",
+            "Number of batches that carried two or more prefilling slots",
+            (double) metrics.n_prefill_batches_shared
+        }, {
             "n_decode_total",
             "Total number of llama_decode() calls, excluding speculative decoding and multimodal decoding",
             (double) metrics.n_decode
@@ -1627,6 +1643,18 @@ std::string server_task_result_metrics::to_metrics() {
             "requests_deferred",
             "Number of requests deferred",
             (double) n_tasks_deferred
+        }, {
+            "slots_prefilling",
+            "Number of slots admitted to prefill in the last batch",
+            (double) n_prefilling_slots
+        }, {
+            "slots_prefill_waiting",
+            "Number of slots waiting for prefill admission",
+            (double) n_prefill_waiting_slots
+        }, {
+            "slots_generating",
+            "Number of slots generating tokens",
+            (double) n_generating_slots
         }, {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",

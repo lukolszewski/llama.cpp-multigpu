@@ -144,6 +144,7 @@ json server_slot_stats::to_json() const {
 
         {"prompt_n",               n_prompt_processed},
         {"prompt_ms",              t_prompt_ms()},
+        {"prefill_wait_ms",        t_prefill_wait_ms()},
         {"prompt_per_token_ms",    t_prompt_per_token_ms()},
         {"prompt_per_second",      n_prompt_tps()},
 
