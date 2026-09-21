@@ -135,6 +135,10 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_idx::init_full_ns(uint32_t n_stream_res) {
+    return std::make_unique<llama_memory_hybrid_idx_context>(this, n_stream_res);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
 }
@@ -490,6 +494,17 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         i_kpool  = 0;
     }
 }
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_stream_res) :
+    llama_memory_hybrid_context(mem, n_stream_res),
+    mem(mem),
+    // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
+    // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
+    ns_ubatch(mem->get_mem_idx() == nullptr ?
+        std::vector<uint32_t>() : std::vector<uint32_t>{ n_stream_res > 0 ? std::min(n_stream_res, mem->get_mem_idx()->get_n_stream()) : mem->get_mem_idx()->get_n_stream() }),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx(), n_stream_res)),
+    is_full(true) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,

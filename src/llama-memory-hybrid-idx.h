@@ -55,6 +55,9 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // full context over the first n_stream_res streams only: reserves the graph of an n_stream_res-sequence ubatch
+    llama_memory_context_ptr init_full_ns(uint32_t n_stream_res);
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     void clear(bool data) override;
@@ -155,6 +158,8 @@ public:
 
     // used to create a full-cache context
     explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
+
+    llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_stream_res);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(

@@ -5013,7 +5013,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        if (graph_compatible) {
+        // GGML_CUDA_GRAPHS_FORCE=1: capture (and instantiate/update) a CUDA graph on every call whose tensor
+        // properties changed, instead of executing it directly and waiting for two identical calls. Turns each
+        // prefill ubatch stage into a single graph launch, so the host is not throttled by the kernel launch
+        // queue and can run several ubatches ahead across the GPUs (pipeline parallelism).
+        static const bool graphs_force = getenv("GGML_CUDA_GRAPHS_FORCE") != nullptr && atoi(getenv("GGML_CUDA_GRAPHS_FORCE")) != 0;
+        if (graph_compatible && graphs_force) {
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            graph->warmup_complete = true;
+            use_cuda_graph = true;
+            cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+        } else if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {

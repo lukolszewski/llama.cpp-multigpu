@@ -1898,6 +1898,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
 
+    if (getenv("GGML_SCHED_LOG_REALLOC")) {
+        GGML_LOG_WARN("%s: model nodes = %d, leafs = %d, splits = %d, graph inputs = %d, split inputs total = %d, dep nodes = %d, n_copies = %d\n", __func__,
+                graph->n_nodes, graph->n_leafs, sched->n_splits, sched->n_graph_inputs, total_inputs - sched->n_graph_inputs, n_dep_nodes, sched->n_copies);
+    }
+
     // remember the actual graph_size for performing reallocation checks later
     sched->prev_graph_size = sched->graph_size;
     sched->graph_size = graph_size;
@@ -2052,6 +2057,18 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (unexpected || sched->debug_realloc > 1) {
                 GGML_ABORT("%s: unexpected graph reallocation (graph size = %d, nodes = %d, leafs = %d), debug_realloc = %d\n", __func__,
                         sched->graph_size, sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_realloc);
+            }
+        }
+
+        // GGML_SCHED_LOG_REALLOC=1: report every reallocation (each one fully synchronizes all backends,
+        // which defeats pipeline parallelism when it happens on every graph)
+        {
+            static const bool log_realloc = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
+            static int n_realloc = 0;
+            if (log_realloc) {
+                n_realloc++;
+                GGML_LOG_WARN("%s: graph reallocation #%d (backend_ids_changed = %d, graph size = %d, nodes = %d, leafs = %d)\n", __func__,
+                        n_realloc, backend_ids_changed, sched->debug_graph_size, sched->graph.n_nodes, sched->graph.n_leafs);
             }
         }
 

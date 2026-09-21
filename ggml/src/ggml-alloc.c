@@ -1011,6 +1011,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
+        if (getenv("GGML_SCHED_LOG_REALLOC")) {
+            GGML_LOG_WARN("%s: realloc trigger: n_nodes %d (galloc) != %d (graph)\n", __func__, galloc->n_nodes, graph->n_nodes);
+        }
         return true;
     }
 
@@ -1018,6 +1021,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
+        if (getenv("GGML_SCHED_LOG_REALLOC")) {
+            GGML_LOG_WARN("%s: realloc trigger: n_leafs %d (galloc) != %d (graph)\n", __func__, galloc->n_leafs, graph->n_leafs);
+        }
         return true;
     }
 
@@ -1029,6 +1035,11 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
+            if (getenv("GGML_SCHED_LOG_REALLOC")) {
+                GGML_LOG_WARN("%s: realloc trigger: node %d '%s' op=%s buffer_id=%d size_max=%zu ne=[%ld,%ld,%ld,%ld] data=%p view_src=%p\n", __func__,
+                        i, node->name, ggml_op_name(node->op), node_alloc->dst.buffer_id, node_alloc->dst.size_max,
+                        (long) node->ne[0], (long) node->ne[1], (long) node->ne[2], (long) node->ne[3], node->data, (void *) node->view_src);
+            }
             return true;
         }
 
@@ -1038,6 +1049,11 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
+                if (getenv("GGML_SCHED_LOG_REALLOC")) {
+                    GGML_LOG_WARN("%s: realloc trigger: node %d '%s' src%d '%s' op=%s buffer_id=%d size_max=%zu ne=[%ld,%ld,%ld,%ld] data=%p view_src=%p\n", __func__,
+                            i, node->name, j, src->name, ggml_op_name(src->op), node_alloc->src[j].buffer_id, node_alloc->src[j].size_max,
+                            (long) src->ne[0], (long) src->ne[1], (long) src->ne[2], (long) src->ne[3], src->data, (void *) src->view_src);
+                }
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif

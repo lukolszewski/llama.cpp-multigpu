@@ -87,6 +87,18 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
     is_capturing = (capture_status != cudaStreamCaptureStatusNone);
 #endif  // USE_CUDA_GRAPH
 
+    // DeviceSegmentedSort is not stream-ordered: its dispatch copies partition sizes back to the host and waits for
+    // the stream to reach that point, which blocks the calling thread until every earlier kernel on the stream has
+    // finished (observed with gdb: spinning in cuMemcpyDtoHAsync under DeviceSegmentedSort::SortPairsDescending).
+    // With pipeline parallelism that serializes the whole multi-GPU pipeline on every sort. DeviceSegmentedRadixSort
+    // is fully asynchronous, so use it unless GGML_CUDA_SEGMENTED_SORT=1 asks for the old behaviour.
+    {
+        static const bool use_segmented_sort = getenv("GGML_CUDA_SEGMENTED_SORT") != nullptr && atoi(getenv("GGML_CUDA_SEGMENTED_SORT")) != 0;
+        if (!use_segmented_sort) {
+            is_capturing = true; // take the DeviceSegmentedRadixSort branches below
+        }
+    }
+
     if (order == GGML_SORT_ORDER_ASC) {
         if (nrows == 1) {
             CUDA_CHECK(DeviceRadixSort::SortPairs(nullptr, temp_storage_bytes, temp_keys, temp_keys_out,  // keys in, keys out

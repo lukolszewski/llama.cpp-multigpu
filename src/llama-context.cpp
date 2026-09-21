@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -378,6 +379,9 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
+        const char * LLAMA_RESERVE_ON_DEMAND_DISABLE = getenv("LLAMA_RESERVE_ON_DEMAND_DISABLE");
+        reserve_on_demand_disable = LLAMA_RESERVE_ON_DEMAND_DISABLE ? (atoi(LLAMA_RESERVE_ON_DEMAND_DISABLE) != 0) : reserve_on_demand_disable;
+
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
@@ -525,13 +529,27 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // LLAMA_PIPELINE_PARALLEL=1 keeps pipeline parallelism on despite tensor overrides (for
+        // overrides that only move input-stage tensors such as per-layer embeddings to the CPU),
+        // LLAMA_PIPELINE_PARALLEL=0 forces it off
+        const char * env_pp = getenv("LLAMA_PIPELINE_PARALLEL");
+        const int   force_pp = env_pp ? atoi(env_pp) : -1;
+
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides() &&
+            (!model.has_tensor_overrides() || force_pp == 1) &&
             cparams.moe_cache_size == 0; // not supported by the MoE cache
+
+        if (force_pp == 0) {
+            pipeline_parallel = false;
+        }
+
+        if (model.has_tensor_overrides() && force_pp == 1) {
+            LLAMA_LOG_WARN("%s: pipeline parallelism forced on with tensor overrides (LLAMA_PIPELINE_PARALLEL=1)\n", __func__);
+        }
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -557,6 +575,9 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: pipeline parallelism disabled (devices=%zu, tensor overrides=%d, n_batch=%u, n_ubatch=%u)\n", __func__,
+                    model.n_devices(), (int) model.has_tensor_overrides(), cparams.n_batch, cparams.n_ubatch);
         }
 
         if (cparams.moe_cache_size > 0) {
@@ -757,6 +778,10 @@ void llama_context::sched_reserve() {
 
     sched_new(max_nodes, cparams.pipeline_parallel);
 
+    if (cparams.pipeline_parallel) {
+        LLAMA_LOG_INFO("%s: pipeline parallelism: n_copies = %d\n", __func__, ggml_backend_sched_get_n_copies(sched.get()));
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -840,6 +865,21 @@ void llama_context::sched_reserve() {
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
                 break;
+            case LLM_ARCH_QWEN4EXP:
+            case LLM_ARCH_GLM5_NEXT:
+                {
+                    // the gated delta-net graph topology depends on n_seq_tokens, so a single-sequence
+                    // prefill (the common server case) must match the reserved graph exactly, or ggml-alloc
+                    // reallocates (and synchronizes every backend) on every ubatch. The sparse attention
+                    // needs the memory context to span exactly the ubatch's streams.
+                    auto * mem_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+                    auto mctx1 = mem_idx ? mem_idx->init_full_ns(1) : nullptr;
+                    if (mctx1 && mctx1->get_status() == LLAMA_MEMORY_STATUS_SUCCESS) {
+                        gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx1.get(), model.no_alloc());
+                    } else {
+                        gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());
+                    }
+                } break;
             default:
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());
         };
@@ -1548,7 +1588,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        // with pipeline parallelism the compute buffers must already hold the worst case for
+        // this graph shape: otherwise the scheduler reallocates on every ubatch whose inputs
+        // grow (e.g. the KQ mask with n_kv), and each reallocation synchronizes all backends,
+        // which serializes the pipeline. The initial reserve covers one shape class only
+        // (n_seq_max streams), so re-reserve at full context when the class changes.
+        if (cparams.pipeline_parallel && !reserve_on_demand_disable) {
+            const uint32_t key_tokens  = ubatch.n_tokens;
+            const uint32_t key_seqs    = ubatch.n_seqs;
+            // 0 and 1 outputs build the same graph (an empty out_ids gather); graph_reserve needs at least 1
+            const uint32_t key_outputs = std::max<uint32_t>(1, std::min<uint32_t>(this->n_outputs, cparams.n_outputs_max));
+
+            if (key_tokens != reserve_key_tokens || key_seqs != reserve_key_seqs || key_outputs != reserve_key_outputs) {
+                // the sparse attention needs the memory context to span exactly the ubatch's streams
+                auto * mem_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+                const auto mctx_full = mem_idx ? mem_idx->init_full_ns(key_seqs) : memory->init_full();
+                if (mctx_full && mctx_full->get_status() == LLAMA_MEMORY_STATUS_SUCCESS) {
+                    // the reserve reallocates the compute buffers: nothing may be in flight
+                    ggml_backend_sched_synchronize(sched.get());
+
+                    auto * gf_res = graph_reserve_ubatch(ubatch, mctx_full.get());
+                    if (gf_res) {
+                        LLAMA_LOG_INFO("%s: re-reserved compute buffers for n_tokens = %u, n_seqs = %u, n_outputs = %u (nodes = %d)\n", __func__,
+                                key_tokens, key_seqs, key_outputs, ggml_graph_n_nodes(gf_res));
+                    } else {
+                        LLAMA_LOG_WARN("%s: re-reserve for n_tokens = %u, n_seqs = %u failed, continuing\n", __func__, key_tokens, key_seqs);
+                    }
+                }
+                reserve_key_tokens  = key_tokens;
+                reserve_key_seqs    = key_seqs;
+                reserve_key_outputs = key_outputs;
+            }
+        }
+
         gf_res_prev_active = nullptr;
+
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2641,6 +2715,7 @@ static void ubatch_prepare_reserve(
     }
 }
 
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -2698,6 +2773,36 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);
+        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        return nullptr;
+    }
+
+    return gf;
+}
+
+// reserve the compute buffers for the graph of a *real* ubatch against a full-context memory:
+// identical topology to what process_ubatch() is about to build (same tokens, outputs, sequences,
+// same backend fusion decisions), with the sizes of the full context
+ggml_cgraph * llama_context::graph_reserve_ubatch(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) {
+    ggml_backend_sched_reset(sched.get());
+
+    // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+
+    auto * res = gf_res_reserve.get();
+
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    res->reset();
+
+    auto * gf = model.build_graph(gparams);
+
+    if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
     }

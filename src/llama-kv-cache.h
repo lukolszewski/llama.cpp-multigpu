@@ -129,6 +129,9 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // full context over the first n_stream_res streams only (0 = all); used to reserve graphs for a given number of sequences
+    llama_memory_context_ptr init_full_ns(uint32_t n_stream_res);
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -369,7 +372,8 @@ public:
 
     // used to create a full-cache context
     llama_kv_cache_context(
-            llama_kv_cache * kv);
+            llama_kv_cache * kv,
+            uint32_t n_stream_res = 0);
 
     // used to create an update context
     llama_kv_cache_context(

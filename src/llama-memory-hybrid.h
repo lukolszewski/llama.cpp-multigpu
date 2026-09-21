@@ -100,6 +100,9 @@ public:
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
 
+    // full context whose attention part spans only the first n_stream_res streams (graph reservation)
+    llama_memory_hybrid_context(llama_memory_hybrid * mem, uint32_t n_stream_res);
+
     // init update
     explicit llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
