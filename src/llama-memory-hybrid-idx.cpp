@@ -78,12 +78,19 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
 
+        // LLAMA_DECODE_PIPELINE: once the batch is recognized as a pure multi-sequence decode, every ubatch is a
+        // per-sequence split (not only the first one - otherwise the rest of the batch falls back to one
+        // multi-sequence ubatch, the two graph shapes alternate, and reuse/reserve thrash on every ubatch)
+        bool pipeline_split = false;
+
         while (true) {
             llama_ubatch ubatch;
 
             if (embd_all) {
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
+            } else if (pipeline_split) {
+                ubatch = balloc.split_seq(1);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (get_mem_attn()->get_n_stream() == 1);
@@ -94,6 +101,20 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
                 ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+
+                // LLAMA_DECODE_PIPELINE=1: a pure decode batch of several sequences (one token each) is split into one
+                // ubatch per sequence instead of one ubatch holding all of them. On a layer-split multi-GPU box the
+                // single ubatch walks the devices one at a time (each card busy ~10 % of the step, nsys 2026-10-03);
+                // per-sequence ubatches let the scheduler's pipeline overlap them across the cards. The graph is not
+                // reused between ubatches of different sequences (allow_reuse keys on the sequence set), so this trades
+                // host-side graph builds for GPU overlap; off by default until measured.
+                static const bool decode_pipeline = getenv("LLAMA_DECODE_PIPELINE") != nullptr && atoi(getenv("LLAMA_DECODE_PIPELINE")) != 0;
+                if (decode_pipeline && !unified && ubatches.empty() && ubatch.n_tokens > 1 && ubatch.n_seq_tokens == 1 &&
+                        ubatch.n_seqs > 1 && ubatch.n_tokens == balloc.get_n_tokens()) {
+                    balloc.split_reset();
+                    pipeline_split = true;
+                    ubatch = balloc.split_seq(1);
+                }
             }
 
             if (ubatch.n_tokens == 0) {
