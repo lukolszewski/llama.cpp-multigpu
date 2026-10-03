@@ -2872,7 +2872,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = std::max<int32_t>((int32_t) kv->get_n_kv(sinfos[i_cur]), (int32_t) n_kv_min);
 
     return true;
 }
@@ -2905,6 +2905,28 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_all(ggml_context * ctx, int32_t il) const {
+    llama_kv_cache::slot_info all;
+    all.s0 = 0;
+    all.s1 = kv->get_n_stream() - 1;
+    return kv->get_k(ctx, il, kv->get_size(), all);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_all(ggml_context * ctx, int32_t il) const {
+    llama_kv_cache::slot_info all;
+    all.s0 = 0;
+    all.s1 = kv->get_n_stream() - 1;
+    return kv->get_v(ctx, il, kv->get_size(), all);
+}
+
+uint32_t llama_kv_cache_context::get_s0() const {
+    return sinfos.empty() ? 0 : sinfos[i_cur].s0;
+}
+
+uint32_t llama_kv_cache_context::get_kv_size() const {
+    return kv->get_size();
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

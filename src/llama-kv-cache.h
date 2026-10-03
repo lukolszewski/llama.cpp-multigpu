@@ -413,6 +413,16 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
+    // stream-agnostic decode graphs (LLAMA_DECODE_PIPELINE): views over all streams from stream 0 with ne[2] = kv_size,
+    // the ubatch's stream index (sinfo.s0) and the per-stream row count, so that the graph addresses row cell + s0*kv_size
+    ggml_tensor * get_k_all(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_all(ggml_context * ctx, int32_t il) const;
+    uint32_t get_s0() const;
+    uint32_t get_kv_size() const;
+
+    // force n_kv to be at least this (set by the batch owner so that every per-stream ubatch builds the same shapes)
+    void set_n_kv_min(uint32_t n) { n_kv_min = n; }
+
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
     //   - k_cur  [n_embd_head_k, n_head_k, n_tokens]
@@ -473,4 +483,5 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+    uint32_t n_kv_min = 0;
 };

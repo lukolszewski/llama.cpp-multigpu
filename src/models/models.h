@@ -3076,18 +3076,22 @@ struct llama_model_glm5_next : public llama_model_base {
                                       int64_t d_conv, int64_t head_dim, int64_t n_head_kda,
                                       int64_t d_inner, int64_t n_seq_tokens, int64_t n_seqs, int il);
 
+        // compact decode (inp_kpool->strm): returns nullptr and sets *cidx (flat cache rows) and *cmask (0/-inf)
         ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * qr, const llama_layer & layer,
-                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
+                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il,
+                                         ggml_tensor ** cidx = nullptr, ggml_tensor ** cmask = nullptr);
 
-        // attention output (cur) and the selection to carry to the next shared layer (sel)
+        // attention output (cur) and the selection to carry to the next shared layer (sel, or cidx/cmask when compact)
         struct dsa_out {
-            ggml_tensor * cur;
-            ggml_tensor * sel;
+            ggml_tensor * cur   = nullptr;
+            ggml_tensor * sel   = nullptr;
+            ggml_tensor * cidx  = nullptr;
+            ggml_tensor * cmask = nullptr;
         };
 
         dsa_out build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
                                 const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
-                                llm_graph_input_kpool * inp_kpool, ggml_tensor * prev_sel, int il);
+                                llm_graph_input_kpool * inp_kpool, const dsa_out & prev, int il);
 
     };
 

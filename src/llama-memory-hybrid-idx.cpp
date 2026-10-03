@@ -149,8 +149,28 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             heads_idx = heads_attn;
         }
 
-        return std::make_unique<llama_memory_hybrid_idx_context>(
+        // per-sequence decode ubatches (LLAMA_DECODE_PIPELINE): give them all the batch's largest n_kv so that
+        // they build identical graph shapes and the graph is reused across streams
+        uint32_t n_kv_min = 0;
+        if (ubatches.size() > 1) {
+            bool pure_decode = true;
+            for (const auto & ub : ubatches) {
+                pure_decode &= ub.n_tokens == 1 && ub.n_seqs == 1;
+            }
+            if (pure_decode) {
+                for (const auto & si : heads_attn) {
+                    n_kv_min = std::max(n_kv_min, get_mem_attn()->get_n_kv(si));
+                }
+            }
+        }
+
+        auto res = std::make_unique<llama_memory_hybrid_idx_context>(
                 this, std::move(heads_attn), std::move(heads_idx), std::move(ubatches));
+        if (n_kv_min > 0) {
+            res->set_n_kv_min(n_kv_min);
+            res->set_pipelined(true);
+        }
+        return res;
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -648,6 +668,23 @@ llama_memory_hybrid_idx_context::kpool_access llama_memory_hybrid_idx_context::g
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
     return kpool_access(ctx, mem->get_mem_idx()->get_k_storage(il), n_embd);
+}
+
+void llama_memory_hybrid_idx_context::set_pipelined(bool v) {
+    set_decode_pipelined(v);
+    const_cast<llama_kv_cache_context *>(get_attn())->set_decode_pipelined(v);
+    const_cast<llama_memory_recurrent_context *>(get_recr())->set_decode_pipelined(v);
+    if (ctx_idx) {
+        static_cast<llama_kv_cache_context *>(ctx_idx.get())->set_decode_pipelined(v);
+    }
+}
+
+void llama_memory_hybrid_idx_context::set_n_kv_min(uint32_t n) {
+    // only the shape floor changes; the contexts stay logically const for the graph
+    const_cast<llama_kv_cache_context *>(get_attn())->set_n_kv_min(n);
+    if (ctx_idx) {
+        static_cast<llama_kv_cache_context *>(ctx_idx.get())->set_n_kv_min(n);
+    }
 }
 
 // k-pool DSA indexer (glm5-next, qwen4exp QSA)

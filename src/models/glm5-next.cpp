@@ -196,7 +196,7 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                                  int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
                                  int64_t d_conv, int64_t head_dim, int64_t n_head,
                                  int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
-                                 int64_t mem_size, int64_t K_rs) {
+                                 int64_t mem_size, int64_t K_rs, ggml_tensor * rs_idx) {
     const int64_t d_inner         = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
     const int64_t n_embd_r_total  = 3 * conv_state_size;
@@ -216,6 +216,16 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
         const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
         ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
             conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
+        if (rs_idx) {
+            // stream-agnostic decode graph (LLAMA_DECODE_PIPELINE): index-based write of this third (q/k/v) of each
+            // cell row in slot s, rows = recurrent cells
+            ggml_tensor * slot_rows = ggml_view_2d(ctx0, conv_states_all, conv_state_size, mem_size,
+                    n_embd_r_total * ggml_element_size(conv_states_all),
+                    ((size_t) s * mem_size * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_all));
+            ggml_tensor * src2d = ggml_reshape_2d(ctx0, ggml_cont(ctx0, conv_x_s), conv_state_size, n_seqs);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slot_rows, src2d, rs_idx));
+            continue;
+        }
         ggml_build_forward_expand(gf,
             ggml_cpy(ctx0, conv_x_s,
                 ggml_view_3d(ctx0, conv_states_all, d_conv - 1, d_inner, n_seqs,
@@ -242,6 +252,18 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, sel_mask, new_pool_idxs, new_pool_rep, ubatch);
+        if (strm && strm->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(strm->buffer));
+            ((int32_t *) strm->data)[0] = (int32_t) mctx->get_attn()->get_s0();
+        }
+    }
+
+    // compact decode attention: gather the selected latent rows from the flat all-stream cache (row = cell + strm*kv_size)
+    // instead of masking the stream's K view, so the graph does not depend on the stream. Always for the per-sequence
+    // ubatches of LLAMA_DECODE_PIPELINE, opt-in for every single-token ubatch with LLAMA_DSA_COMPACT=1.
+    static bool want_compact(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub) {
+        static const bool env = getenv("LLAMA_DSA_COMPACT") != nullptr && atoi(getenv("LLAMA_DSA_COMPACT")) != 0;
+        return ub.n_tokens == 1 && (mctx->decode_pipelined() || env);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -261,6 +283,7 @@ public:
         // The scatter mask shape follows n_kv.
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == std::max(mctx->get_n_kpool_new(), 1u);
+        res &= (strm != nullptr) == want_compact(mctx, params.ubatch);
 
         return res;
     }
@@ -274,6 +297,7 @@ public:
     // n_new is never below 1, see build_inp_kpool
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool*n_new]    members of the pools completed this ubatch
     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          cell to write each new pooled key into
+    ggml_tensor * strm          = nullptr; // I32     [1]              compact decode only: the ubatch's KV stream
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
@@ -337,6 +361,12 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     // one scatter row per new pool, each a distinct rep row (see kpool_build_state)
     inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_new);
     ggml_set_input(inp->new_pool_rep);
+
+    if (llm_graph_input_kpool::want_compact(mctx_hyb, ubatch)) {
+        inp->strm = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(inp->strm);
+        ggml_set_name(inp->strm, "kpool_strm");
+    }
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
@@ -609,7 +639,7 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_attn_norm", il);
 
     // the NextN block has a full indexer, nothing to carry in
-    dsa_out dsa = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, nullptr, il);
+    dsa_out dsa = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, dsa_out{}, il);
     cur = dsa.cur;
     cb(cur, "mtp_attn_out", il);
 
@@ -705,7 +735,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
-    ggml_tensor * prev_sel = nullptr;
+    dsa_out prev_sel = {};
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -725,7 +755,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         } else {
             dsa_out dsa = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, prev_sel, il);
             cur = dsa.cur;
-            prev_sel = dsa.sel;
+            prev_sel = dsa;
         }
 
         inpL = build_hc_post(cur, residual, attn_hc.post, attn_hc.comb, il);
@@ -820,9 +850,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     const int64_t mem_size = mctx_cur->get_size();
     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
 
-    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs, inp_rs->rs_idx);
+    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs, inp_rs->rs_idx);
+    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs, inp_rs->rs_idx);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);
@@ -888,7 +918,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
 ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         ggml_tensor * cur, ggml_tensor * qr, const llama_layer & layer,
-        const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il) {
+        const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il,
+        ggml_tensor ** cidx, ggml_tensor ** cmask) {
 
     const auto * mctx_lid = mctx_hyb->get_idx();
 
@@ -974,6 +1005,47 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
         ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], UNORDERED
 
+        if (inp_kpool->strm) {
+            // compact decode (one token): the selected cells as flat all-stream rows plus a 0/-inf liveness mask,
+            // padded to a multiple of 256 slots. A slot is live if its pool scored finite (visible) and its cell
+            // is not the n_kv sentinel; dead slots read row strm*kv_size and are masked.
+            GGML_ASSERT(n_tokens == 1 && cidx && cmask);
+            const int64_t kv_size = mctx_hyb->get_attn()->get_kv_size();
+            ggml_tensor * tk = ggml_is_contiguous(top_k) ? top_k : ggml_cont(ctx0, top_k);
+
+            ggml_tensor * idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs, ggml_reshape_1d(ctx0, tk, n_top_pool)); // [kpool, n_top_pool]
+            idx = ggml_cast(ctx0, ggml_reshape_1d(ctx0, idx, kpool*n_top_pool), GGML_TYPE_F32);
+
+            ggml_tensor * psc = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, score, 1, n_pool), ggml_reshape_1d(ctx0, tk, n_top_pool)); // [1, n_top_pool]
+            ggml_tensor * live = ggml_step(ctx0, ggml_scale_bias(ctx0, psc, 1.0f, 1e30f));                    // finite -> 1
+            live = ggml_reshape_1d(ctx0, ggml_repeat_4d(ctx0, live, kpool, n_top_pool, 1, 1), kpool*n_top_pool);
+
+            if (hparams.indexer_kpool_select_tail) {
+                ggml_tensor * tail = ggml_cast(ctx0, ggml_reshape_1d(ctx0, inp_kpool->tail_idxs, kpool - 1), GGML_TYPE_F32);
+                idx  = ggml_concat(ctx0, idx, tail, 0);
+                live = ggml_concat(ctx0, live, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, kpool - 1), 1.0f), 0);
+            }
+            const int64_t n_sel_c = idx->ne[0];
+            GGML_ASSERT(n_sel_c == (int64_t) inp_kpool->n_sel);
+
+            // the n_kv sentinel (padded pools, missing tail cells) is dead
+            live = ggml_mul(ctx0, live, ggml_step(ctx0, ggml_scale_bias(ctx0, idx, -1.0f, (float) n_kv - 0.5f)));
+
+            const int64_t n_w = GGML_PAD(n_sel_c, 256);
+            if (n_w > n_sel_c) {
+                idx  = ggml_pad(ctx0, idx,  n_w - n_sel_c, 0, 0, 0);
+                live = ggml_pad(ctx0, live, n_w - n_sel_c, 0, 0, 0);
+            }
+
+            ggml_tensor * off = ggml_scale(ctx0, ggml_cast(ctx0, inp_kpool->strm, GGML_TYPE_F32), (float) kv_size); // [1]
+            *cidx  = ggml_cast(ctx0, ggml_add(ctx0, ggml_mul(ctx0, idx, live), off), GGML_TYPE_I32);              // [n_w]
+            *cmask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, ggml_log(ctx0, live), n_w, 1, 1, 1), type_mask);       // 0 / -inf
+            cb(*cidx,  "indexer_cidx",  il);
+            cb(*cmask, "indexer_cmask", il);
+
+            return nullptr;
+        }
+
         // keep the cells of the live picked pools and the tail, -inf elsewhere
         // all retained cells are in the token's sequence, so the kq_mask is not needed
         if (cparams.fused_top_k_mask) {
@@ -1046,7 +1118,7 @@ llama_model_glm5_next::graph::dsa_out
 llama_model_glm5_next::graph::build_dsa_layer(
         ggml_tensor * cur, const llama_layer & layer,
         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
-        llm_graph_input_kpool * inp_kpool, ggml_tensor * prev_sel, int il) {
+        llm_graph_input_kpool * inp_kpool, const dsa_out & prev, int il) {
 
     const auto * mctx_mla = mctx_hyb->get_attn();
 
@@ -1078,9 +1150,40 @@ llama_model_glm5_next::graph::build_dsa_layer(
     ggml_tensor * k = mctx_mla->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * sel = prev_sel;
+    ggml_tensor * sel   = prev.sel;
+    ggml_tensor * cidx  = prev.cidx;
+    ggml_tensor * cmask = prev.cmask;
     if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) { // the NextN block always has a full indexer
-        sel = build_kpool_select(cur, qr, layer, mctx_hyb, inp_kpool, il);
+        sel = build_kpool_select(cur, qr, layer, mctx_hyb, inp_kpool, il, &cidx, &cmask);
+    }
+
+    if (inp_kpool->strm) {
+        // compact decode: attend the gathered selection only (see build_kpool_select)
+        GGML_ASSERT(cidx && cmask && "shared indexer layer must follow a full indexer layer");
+
+        ggml_build_forward_expand(gf, q_absorbed);
+        ggml_build_forward_expand(gf, kv_cmpr);
+        ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
+
+        ggml_tensor * k4 = mctx_mla->get_k_all(ctx0, il);              // [D, 1, kv_size, n_stream]
+        GGML_ASSERT(k4->ne[1] == 1 && k4->nb[3] == k4->nb[2]*k4->ne[2]);
+        ggml_tensor * k2 = ggml_view_2d(ctx0, k4, k4->ne[0], k4->ne[2]*k4->ne[3], k4->nb[2], 0);
+        const int64_t n_w = cidx->ne[0];
+        ggml_tensor * kc = ggml_get_rows(ctx0, k2, cidx);              // F32 [D, n_w]
+        kc = ggml_cast(ctx0, ggml_reshape_4d(ctx0, kc, k4->ne[0], 1, n_w, 1), GGML_TYPE_F16);
+        cb(kc, "k_compact", il);
+        ggml_tensor * vc = ggml_view_4d(ctx0, kc, kv_lora_rank, 1, n_w, 1, kc->nb[1], kc->nb[2], kc->nb[3], 0);
+
+        ggml_tensor * out = build_attn_mha(q_absorbed, kc, vc, nullptr, cmask, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+        cb(out, "kqv_out", il);
+
+        out = ggml_mul_mat(ctx0, layer.wo, out);
+        cb(out, "attn_out", il);
+
+        return { out, nullptr, cidx, cmask };
+    }
+
+    if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) {
 
         // the selection replaces the kq_mask: split it into the streams of the K view
         const int64_t n_stream = k->ne[3];
@@ -1102,5 +1205,5 @@ llama_model_glm5_next::graph::build_dsa_layer(
     out = ggml_mul_mat(ctx0, layer.wo, out);
     cb(out, "attn_out", il);
 
-    return { out, sel };
+    return { out, sel, nullptr, nullptr };
 }

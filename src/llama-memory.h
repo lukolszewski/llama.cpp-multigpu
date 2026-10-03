@@ -95,6 +95,15 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // LLAMA_DECODE_PIPELINE: this context's ubatches are the per-sequence split of a multi-sequence decode batch,
+    // so the graph is built stream-agnostic (every stream-dependent address is an input) and reused across them.
+    // false for an unsplit batch (solo decode keeps the cheaper per-stream graph).
+    bool decode_pipelined() const { return m_decode_pipelined; }
+    void set_decode_pipelined(bool v) { m_decode_pipelined = v; }
+
+private:
+    bool m_decode_pipelined = false;
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

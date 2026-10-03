@@ -1582,7 +1582,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // per-sequence decode ubatches of the stream-agnostic graph (LLAMA_DECODE_PIPELINE) skip this: the scheduler
+        // copies user inputs synchronously at compute time and rotates its device-side input copies (n_copies), so
+        // overwriting the host-side inputs here is safe and the ubatches overlap across the devices like prefill ubatches
+        const bool decode_pipelined = llm_graph_decode_pipeline() && ubatch.n_tokens == 1 && ubatch.n_seqs == 1;
+        if (cparams.pipeline_parallel && !decode_pipelined) {
             ggml_backend_sched_synchronize(sched.get());
         }
 

@@ -203,6 +203,11 @@ public:
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
 
+    // stream-agnostic decode (LLAMA_DECODE_PIPELINE): every per-stream ubatch of a batch builds the same n_kv
+    void set_n_kv_min(uint32_t n);
+    void set_pipelined(bool v);
+
+
 private:
     llama_memory_hybrid_idx * mem = nullptr;
 
