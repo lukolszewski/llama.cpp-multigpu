@@ -1569,6 +1569,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    static const bool ubatch_trace = getenv("LLAMA_UBATCH_TRACE") != nullptr;
+    const int64_t t_trace0 = ubatch_trace ? ggml_time_us() : 0;
+    bool trace_reused = false, trace_reserved = false;
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1591,6 +1595,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        trace_reused = true;
     } else {
         // with pipeline parallelism the compute buffers must already hold the worst case for
         // this graph shape: otherwise the scheduler reallocates on every ubatch whose inputs
@@ -1612,6 +1617,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     ggml_backend_sched_synchronize(sched.get());
 
                     auto * gf_res = graph_reserve_ubatch(ubatch, mctx_full.get());
+                    trace_reserved = true;
                     if (gf_res) {
                         LLAMA_LOG_INFO("%s: re-reserved compute buffers for n_tokens = %u, n_seqs = %u, n_outputs = %u (nodes = %d)\n", __func__,
                                 key_tokens, key_seqs, key_outputs, ggml_graph_n_nodes(gf_res));
@@ -1663,7 +1669,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_trace1 = ubatch_trace ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (ubatch_trace) {
+        const int64_t t_trace2 = ggml_time_us();
+        LLAMA_LOG_WARN("ubatch-trace: n_tokens = %u n_seqs = %u seq0 = %d reused = %d reserved = %d prep = %lld us compute_async = %lld us\n",
+                ubatch.n_tokens, ubatch.n_seqs, ubatch.seq_id && ubatch.seq_id[0] ? (int) ubatch.seq_id[0][0] : -1,
+                (int) trace_reused, (int) trace_reserved, (long long) (t_trace1 - t_trace0), (long long) (t_trace2 - t_trace1));
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

@@ -2160,11 +2160,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     // per backend: the user-input copy slot of this compute has been waited for (see ggml_backend_sched_copy_input)
     bool input_waited[GGML_SCHED_MAX_BACKENDS] = { false };
+    // LLAMA_UBATCH_TRACE: where does the host block while issuing the splits (debug aid)
+    static const bool sched_trace = getenv("LLAMA_UBATCH_TRACE") != nullptr;
+    std::string trace_line;
+    const int64_t t_trace_start = sched_trace ? ggml_time_us() : 0;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t t_trace0 = sched_trace ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2188,6 +2193,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], input_waited);
             }
         }
+
+        const int64_t t_trace1 = sched_trace ? ggml_time_us() : 0;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2233,7 +2240,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        if (sched_trace) {
+            const int64_t t_trace2 = ggml_time_us();
+            char buf[96];
+            snprintf(buf, sizeof(buf), " %s:i%d:n%d:c%lld:l%lld", ggml_backend_name(split_backend), split->n_inputs, split->graph.n_nodes,
+                    (long long) (t_trace1 - t_trace0), (long long) (t_trace2 - t_trace1));
+            trace_line += buf;
+        }
+
         prev_backend_id = split_backend_id;
+    }
+
+    if (sched_trace) {
+        GGML_LOG_WARN("sched-trace: copy=%d n_splits=%d total=%lld us |%s\n", sched->cur_copy, sched->n_splits,
+                (long long) (ggml_time_us() - t_trace_start), trace_line.c_str());
     }
 
     return GGML_STATUS_SUCCESS;

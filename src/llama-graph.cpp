@@ -18,6 +18,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <typeinfo>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -1482,6 +1483,10 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+        }
+        if (!cur && getenv("LLAMA_UBATCH_TRACE")) {
+            LLAMA_LOG_WARN("ubatch-trace: input %s rejects reuse (n_tokens = %u, n_seqs = %u)\n",
+                    typeid(*input).name(), params.ubatch.n_tokens, params.ubatch.n_seqs);
         }
 
         res = res && cur;
