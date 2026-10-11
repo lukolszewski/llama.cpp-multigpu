@@ -1,0 +1,6 @@
+CONTAINER ID   NAME                        CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O         PIDS
+f991a77618d3   vllm-pp6                    3.66%     149.3GiB / 187.8GiB   79.48%    14.4kB / 7.29kB   194GB / 2.65GB    654
+d8a6ea6e97cf   llama-build                 0.00%     1.5MiB / 187.8GiB     0.00%     0B / 0B           18.8GB / 50.3GB   30
+95f630e602bc   airun-llama-sd              0.01%     11.82MiB / 187.8GiB   0.01%     0B / 0B           22.6MB / 10MB     34
+6e1f8b3b6696   airun-nvidia-gpu-exporter   68.84%    24.54MiB / 187.8GiB   0.01%     0B / 0B           72.1MB / 1.54MB   26
+50a19ead49ea   airun-node-exporter         0.00%     16.32MiB / 187.8GiB   0.01%     0B / 0B           56.3MB / 1.06MB   21

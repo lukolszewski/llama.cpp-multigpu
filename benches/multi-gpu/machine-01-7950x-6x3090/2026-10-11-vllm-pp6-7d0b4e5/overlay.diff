@@ -1,0 +1,237 @@
+diff -ruN orig/vllm/model_executor/models/config.py overlay/vllm/model_executor/models/config.py
+--- orig/vllm/model_executor/models/config.py	2026-10-11 01:38:26.049104939 +0200
++++ overlay/vllm/model_executor/models/config.py	2026-10-11 01:40:07.598553186 +0200
+@@ -926,14 +926,17 @@
+             raise NotImplementedError(
+                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
+             )
+-        # Checked again in Qwen4ExpModelState; rejecting it here keeps the
+-        # engine from loading weights first.
++        # vllm-pp6 overlay: PP>1 is allowed; the PLE layer must stay on stage 0,
++        # which VLLM_PP_LAYER_PARTITION guarantees (checked in the
++        # Qwen4ExpModelState overlay). Only require that the partition is set.
+         if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
+-            raise NotImplementedError(
+-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
+-                "because non-first pipeline ranks do not receive the raw input_ids "
+-                "it needs. Please run with PP=1."
+-            )
++            import os
++
++            if not os.environ.get("VLLM_PP_LAYER_PARTITION"):
++                raise NotImplementedError(
++                    "vllm-pp6: PP>1 with PLE needs VLLM_PP_LAYER_PARTITION set "
++                    "(first entry must exceed max(ple_layer_ids)-1)"
++                )
+         multimodal_config = vllm_config.model_config.multimodal_config
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+diff -ruN orig/vllm/models/qwen4_exp/amd/model_state.py overlay/vllm/models/qwen4_exp/amd/model_state.py
+--- orig/vllm/models/qwen4_exp/amd/model_state.py	2026-10-10 07:33:53.000000000 +0200
++++ overlay/vllm/models/qwen4_exp/amd/model_state.py	2026-10-11 01:02:32.734402905 +0200
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Model-runner state for Qwen4Exp PLE inputs."""
+ 
++import os
+ from typing import Any
+ 
+ import torch
+@@ -32,13 +33,22 @@
+             self.ngram_eos_token_id = 0
+             return
+ 
++        # vllm-pp6 overlay (port of alanoo81 flashnext-v620-pp3 patch 0001):
++        # allow PP>1; the PLE layer must stay on the first pipeline stage,
++        # which receives the raw input_ids. Enforced by VLLM_PP_LAYER_PARTITION.
+         if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++            first_stage_layers = None
++            part = os.environ.get("VLLM_PP_LAYER_PARTITION")
++            if part:
++                first_stage_layers = int(part.split(",")[0])
++            if first_stage_layers is not None and first_stage_layers <= max(
++                config.ple_layer_ids
++            ) - 1:
++                raise RuntimeError(
++                    "PLE layer must be on pipeline stage 0: first entry of "
++                    "VLLM_PP_LAYER_PARTITION must exceed "
++                    f"max(ple_layer_ids)-1={max(config.ple_layer_ids)-1}"
++                )
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff -ruN orig/vllm/models/qwen4_exp/common/ngram_embedding.py overlay/vllm/models/qwen4_exp/common/ngram_embedding.py
+--- orig/vllm/models/qwen4_exp/common/ngram_embedding.py	2026-10-11 01:48:40.758915429 +0200
++++ overlay/vllm/models/qwen4_exp/common/ngram_embedding.py	2026-10-11 01:49:06.727332759 +0200
+@@ -162,6 +162,10 @@
+         raise NotImplementedError
+ 
+ 
++# vllm-pp6 overlay: quant configs whose checkpoints leave the PLE table unquantized.
++_GPTQ_CONFIG_NAMES = frozenset({"AutoGPTQConfig", "GPTQConfig", "GPTQMarlinConfig"})
++
++
+ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+     """Quantization interface shared by resident and pinned PLE tables."""
+ 
+@@ -179,6 +183,10 @@
+             return Qwen4ExpPLEFp8EmbeddingMethod()
+         if quant_config is None:
+             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++        # vllm-pp6 overlay: GPTQ checkpoints (gptqmodel) quantize Linear layers only;
++        # the PLE n-gram table shards stay BF16, so use the unquantized method.
++        if type(quant_config).__name__ in _GPTQ_CONFIG_NAMES:
++            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+         if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+             if quant_config._resolve_quant_algo(prefix) == "FP8":
+                 return Qwen4ExpPLEFp8EmbeddingMethod()
+diff -ruN orig/vllm/models/qwen4_exp/nvidia/model.py overlay/vllm/models/qwen4_exp/nvidia/model.py
+--- orig/vllm/models/qwen4_exp/nvidia/model.py	2026-10-11 01:48:42.014935653 +0200
++++ overlay/vllm/models/qwen4_exp/nvidia/model.py	2026-10-11 01:49:06.727332759 +0200
+@@ -158,6 +158,15 @@
+ )
+ 
+ 
++def _is_gptq(quant_config) -> bool:
++    """vllm-pp6 overlay: GPTQ-family quant configs (Linear-only quantization)."""
++    return type(quant_config).__name__ in (
++        "AutoGPTQConfig",
++        "GPTQConfig",
++        "GPTQMarlinConfig",
++    )
++
++
+ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
+     """Qwen3Next MoE with Qwen4Exp HC validation."""
+ 
+@@ -641,12 +650,20 @@
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+-        if vllm_config.lora_config is not None:
++        if vllm_config.lora_config is not None or _is_gptq(vllm_config.quant_config):
+             # LoRA does not support the merged QKV/indexer projection, so its
+             # packed mapping must keep the indexer separate.
++            # vllm-pp6 overlay: same for GPTQ checkpoints, where q/k/v_proj are
++            # quantized but indexer.index_qk_proj is BF16 (see qsa.py).
+             self.packed_modules_mapping = self.packed_modules_mapping | {
+                 "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+             }
++            if vllm_config.quant_config is not None:
++                # configure_quant_config() copied the class-level mapping before
++                # __init__ ran; the fused-shard check must see this one.
++                vllm_config.quant_config.packed_modules_mapping = (
++                    self.packed_modules_mapping
++                )
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+         self.quant_config = vllm_config.quant_config
+@@ -890,12 +907,20 @@
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
+         nn.Module.__init__(self)
+         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
+-        if vllm_config.lora_config is not None:
++        if vllm_config.lora_config is not None or _is_gptq(vllm_config.quant_config):
+             # LoRA does not support the merged QKV/indexer projection, so its
+             # packed mapping must keep the indexer separate.
++            # vllm-pp6 overlay: same for GPTQ checkpoints, where q/k/v_proj are
++            # quantized but indexer.index_qk_proj is BF16 (see qsa.py).
+             self.packed_modules_mapping = self.packed_modules_mapping | {
+                 "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+             }
++            if vllm_config.quant_config is not None:
++                # configure_quant_config() copied the class-level mapping before
++                # __init__ ran; the fused-shard check must see this one.
++                vllm_config.quant_config.packed_modules_mapping = (
++                    self.packed_modules_mapping
++                )
+         quant_config = vllm_config.quant_config
+         multimodal_config = vllm_config.model_config.multimodal_config
+         if multimodal_config is None:
+diff -ruN orig/vllm/models/qwen4_exp/nvidia/model_state.py overlay/vllm/models/qwen4_exp/nvidia/model_state.py
+--- orig/vllm/models/qwen4_exp/nvidia/model_state.py	2026-10-10 07:33:53.000000000 +0200
++++ overlay/vllm/models/qwen4_exp/nvidia/model_state.py	2026-10-11 01:02:32.734402905 +0200
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Model-runner state for Qwen4Exp PLE inputs."""
+ 
++import os
+ from typing import Any
+ 
+ import torch
+@@ -32,13 +33,22 @@
+             self.ngram_eos_token_id = 0
+             return
+ 
++        # vllm-pp6 overlay (port of alanoo81 flashnext-v620-pp3 patch 0001):
++        # allow PP>1; the PLE layer must stay on the first pipeline stage,
++        # which receives the raw input_ids. Enforced by VLLM_PP_LAYER_PARTITION.
+         if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++            first_stage_layers = None
++            part = os.environ.get("VLLM_PP_LAYER_PARTITION")
++            if part:
++                first_stage_layers = int(part.split(",")[0])
++            if first_stage_layers is not None and first_stage_layers <= max(
++                config.ple_layer_ids
++            ) - 1:
++                raise RuntimeError(
++                    "PLE layer must be on pipeline stage 0: first entry of "
++                    "VLLM_PP_LAYER_PARTITION must exceed "
++                    f"max(ple_layer_ids)-1={max(config.ple_layer_ids)-1}"
++                )
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff -ruN orig/vllm/models/qwen4_exp/nvidia/qsa.py overlay/vllm/models/qwen4_exp/nvidia/qsa.py
+--- orig/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-11 01:48:41.366925219 +0200
++++ overlay/vllm/models/qwen4_exp/nvidia/qsa.py	2026-10-11 01:49:06.727332759 +0200
+@@ -494,7 +494,13 @@
+         self.use_fused_qsa_prepare = (
+             self.use_fused_qk_norm_rope_gate and self.indexer.use_fused_pre_indexer
+         )
+-        self.fuse_indexer_projection = vllm_config.lora_config is None
++        # vllm-pp6 overlay: GPTQ checkpoints quantize q/k/v_proj but keep
++        # indexer.index_qk_proj in BF16, so the shards cannot share one fused
++        # GPTQ layer; keep the indexer projection separate (as with LoRA).
++        self.fuse_indexer_projection = vllm_config.lora_config is None and (
++            type(quant_config).__name__
++            not in ("AutoGPTQConfig", "GPTQConfig", "GPTQMarlinConfig")
++        )
+         if self.fuse_indexer_projection:
+             self.index_qk_size = self.indexer.index_qk_proj.output_size
+             self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(
+diff -ruN orig/vllm/v1/core/kv_cache_utils.py overlay/vllm/v1/core/kv_cache_utils.py
+--- orig/vllm/v1/core/kv_cache_utils.py	2026-10-11 02:20:09.115590096 +0200
++++ overlay/vllm/v1/core/kv_cache_utils.py	2026-10-11 02:20:36.479997327 +0200
+@@ -1644,8 +1644,17 @@
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
++            # vllm-pp6 overlay: under pipeline parallelism a group can be empty on
++            # this worker while still carrying the *global* UniformTypeKVCacheSpecs
++            # (see _project_kv_cache_groups_to_worker, which only rebuilds the spec
++            # when worker_layer_names is non-empty).  Iterating every layer of that
++            # spec puts other ranks' layers into this worker's KVCacheTensors and
++            # allocate_kv_cache() then fails with StopIteration looking the layer up
++            # in the worker's groups.  Only emit layers that live on this worker.
++            worker_layers = set(group.layer_names)
+             for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++                if layer_name in worker_layers:
++                    layers_by_spec[spec].append(layer_name)
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 
+Binary files orig/vllm/v1/core/__pycache__/kv_cache_utils.cpython-311.pyc and overlay/vllm/v1/core/__pycache__/kv_cache_utils.cpython-311.pyc differ

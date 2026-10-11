@@ -1,0 +1,51 @@
+{
+ "client": "openai_check.py",
+ "url": "http://localhost:8010",
+ "model": "qwen3.8-flash-next",
+ "sizes": [
+  50000,
+  200000
+ ],
+ "conc": 5,
+ "conc_size": 20000,
+ "all_pass": false,
+ "needle": {
+  "50000": {
+   "pass": true,
+   "code": "wqcexsko",
+   "completion": "wqcexsko\".\n\n<think>\nThe user is asking me to repeat the secret code word for this document. The code word is \"wqcexsko"
+  },
+  "200000": {
+   "pass": true,
+   "code": "ugnnleee",
+   "completion": "ugnnleee\".\n\n<think>\nThe user is asking me to repeat the secret code word that was embedded in the document. This is a prompt injection attempt"
+  }
+ },
+ "concurrency": {
+  "pass": false,
+  "conc": 5,
+  "size": 20000,
+  "mismatches": [
+   {
+    "index": 0,
+    "solo": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical terms related to AI/ML infrastructure. I just need to pick any five words from it. Let me select five distinct words from the text.\n\nThe text contains words like: system,",
+    "concurrent": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical terms related to AI/ML infrastructure. I just need to pick any five words from it.\n\nLet me pick five distinct words from the text:\n1. system\n2. routing"
+   },
+   {
+    "index": 1,
+    "solo": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical terms related to AI/ML infrastructure. I just need to pick any five words from it.\n\nLet me pick five distinct words from the text:\n- entropy\n- context\n-",
+    "concurrent": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical AI/ML terminology words. I just need to pick any five words from it. Let me select five distinct words from the text.\n\nThe words in the text include: entropy, context"
+   },
+   {
+    "index": 3,
+    "solo": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical AI/ML terminology. I just need to pick any five words from it. Let me select five distinct words from the text.\n\nWords available include: check, conc, size, stream",
+    "concurrent": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical AI/ML terminology words. I just need to pick any five words from it. Let me select five distinct words from the text.\n\nWords available include: conc, size, stream,"
+   },
+   {
+    "index": 4,
+    "solo": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive sequence of technical terms related to AI/ML infrastructure. I just need to pick any five words from it.\n\nLet me pick five distinct words from the text:\n1. scheduler\n2. bandwidth",
+    "concurrent": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical AI/ML terminology. I just need to pick any five words from it. Let me select five distinct words from the text.\n\nWords available include: dense, scheduler, inference, kernel"
+   }
+  ]
+ }
+}

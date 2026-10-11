@@ -1,0 +1,148 @@
+{
+ "client": "readme_grid_openai.py",
+ "label": "vllm-pp6",
+ "url": "http://localhost:8010",
+ "gen_tokens": 128,
+ "rows": [
+  {
+   "slots": 1,
+   "size_tokens": 5000,
+   "gpu_before": "31, 28.39;31, 28.68;47, 33.73;41, 36.67;44, 26.87;52, 24.58;47, 26.57",
+   "t_start": "03:11:29",
+   "pp_agg": 4027.9,
+   "pp_slot_min": 4027.9,
+   "pp_slot_mean": 4027.9,
+   "pp_slot_max": 4027.9,
+   "prompt_n": [
+    4995
+   ],
+   "ttft_min": 1.2,
+   "ttft_max": 1.2,
+   "pp_wall": 1.2,
+   "tg_agg": 56.3,
+   "tg_slot_min": 55.86,
+   "tg_slot_max": 55.86,
+   "tg_slot_mean": 55.86,
+   "prompt_n_round2": [
+    4995
+   ],
+   "tg_wall": 2.3,
+   "texts": [
+    "\n\n<think>\nThe user's message is a massive block of repeated technical terms rela"
+   ],
+   "gpu_after": "39, 176.13;39, 183.22;54, 187.59;49, 190.75;52, 181.07;62, 213.66;47, 26.14"
+  },
+  {
+   "slots": 1,
+   "size_tokens": 50000,
+   "gpu_before": "39, 176.13;39, 183.22;54, 187.59;49, 190.75;52, 181.07;62, 213.66;46, 26.17",
+   "t_start": "03:11:32",
+   "pp_agg": 8365.3,
+   "pp_slot_min": 8365.3,
+   "pp_slot_mean": 8365.3,
+   "pp_slot_max": 8365.3,
+   "prompt_n": [
+    49681
+   ],
+   "ttft_min": 5.9,
+   "ttft_max": 5.9,
+   "pp_wall": 5.9,
+   "tg_agg": 58.09,
+   "tg_slot_min": 57.64,
+   "tg_slot_max": 57.64,
+   "tg_slot_mean": 57.64,
+   "prompt_n_round2": [
+    49681
+   ],
+   "tg_wall": 2.2,
+   "texts": [
+    "\n\n<think>\nThe user's message is an extremely long, repetitive block of text that"
+   ],
+   "gpu_after": "43, 178.06;40, 183.68;55, 188.69;52, 194.49;54, 183.16;63, 215.15;46, 25.34"
+  },
+  {
+   "slots": 1,
+   "size_tokens": 150000,
+   "gpu_before": "43, 178.06;40, 183.68;55, 188.69;52, 194.49;54, 183.16;63, 215.15;46, 25.43",
+   "t_start": "03:11:41",
+   "pp_agg": 9220.2,
+   "pp_slot_min": 9220.2,
+   "pp_slot_mean": 9220.2,
+   "pp_slot_max": 9220.2,
+   "prompt_n": [
+    148981
+   ],
+   "ttft_min": 16.2,
+   "ttft_max": 16.2,
+   "pp_wall": 16.2,
+   "tg_agg": 59.24,
+   "tg_slot_min": 58.77,
+   "tg_slot_max": 58.77,
+   "tg_slot_mean": 58.77,
+   "prompt_n_round2": [
+    148981
+   ],
+   "tg_wall": 2.2,
+   "texts": [
+    "\n\n<think>\nThe user's message is an extremely long block of repeated technical te"
+   ],
+   "gpu_after": "40, 176.87;38, 183.46;58, 190.97;54, 196.14;57, 186.80;63, 214.85;45, 25.66"
+  },
+  {
+   "slots": 1,
+   "size_tokens": 200000,
+   "gpu_before": "40, 176.87;38, 183.46;58, 190.97;54, 196.14;57, 186.80;63, 214.85;45, 25.70",
+   "t_start": "03:11:59",
+   "pp_agg": 9235.0,
+   "pp_slot_min": 9235.0,
+   "pp_slot_mean": 9235.0,
+   "pp_slot_max": 9235.0,
+   "prompt_n": [
+    198631
+   ],
+   "ttft_min": 21.5,
+   "ttft_max": 21.5,
+   "pp_wall": 21.5,
+   "tg_agg": 59.51,
+   "tg_slot_min": 59.04,
+   "tg_slot_max": 59.04,
+   "tg_slot_mean": 59.04,
+   "prompt_n_round2": [
+    198631
+   ],
+   "tg_wall": 2.2,
+   "texts": [
+    "\n\n<think>\nThe user's message is an extremely long block of repeated technical te"
+   ],
+   "gpu_after": "36, 176.02;36, 182.62;60, 194.72;55, 197.25;59, 189.01;62, 214.61;44, 25.44"
+  },
+  {
+   "slots": 1,
+   "size_tokens": 250000,
+   "gpu_before": "36, 176.02;35, 182.04;60, 194.72;55, 197.25;59, 189.01;61, 214.68;44, 25.42",
+   "t_start": "03:12:23",
+   "pp_agg": 9046.1,
+   "pp_slot_min": 9046.1,
+   "pp_slot_mean": 9046.1,
+   "pp_slot_max": 9046.1,
+   "prompt_n": [
+    248281
+   ],
+   "ttft_min": 27.4,
+   "ttft_max": 27.4,
+   "pp_wall": 27.4,
+   "tg_agg": 58.26,
+   "tg_slot_min": 57.8,
+   "tg_slot_max": 57.8,
+   "tg_slot_mean": 57.8,
+   "prompt_n_round2": [
+    248281
+   ],
+   "tg_wall": 2.2,
+   "texts": [
+    "\n\n<think>\nThe user's message is an extremely long, repetitive block of text that"
+   ],
+   "gpu_after": "37, 177.04;37, 182.47;62, 196.15;56, 200.09;61, 192.57;61, 214.13;44, 25.59"
+  }
+ ]
+}
