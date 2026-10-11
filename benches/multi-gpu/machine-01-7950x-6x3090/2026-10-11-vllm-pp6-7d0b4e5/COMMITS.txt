@@ -1,0 +1,6 @@
+vllm commit: 7d0b4e57a (vllm 0.31.1rc1.dev253+g7d0b4e57a, torch 2.13.0+cu129; base image vllm/vllm-openai:cu129-nightly as of 2026-10-10)
+vllm image: vllm-pp6:7d0b4e57a (local derivative: base image with torchcodec removed; Id sha256:eed859ad25fddc9ca83593fc315d5b0b63bfbe87b3fd0fd9499d2533c4e9cb8b, not pushed)
+vllm patches: 7 Python files bind-mounted over /usr/local/lib/python3.12/dist-packages (overlay.diff in this directory; file list in config.json overlay_files)
+checkpoint: btbtyler09/Qwen3.8-Flash-Next-GPTQ-4bit (GPTQ 4-bit g32 Linear-only, 70 files, 188 GB (175 GiB); PLE table / indexer / linear_attn / norms BF16)
+upstream llama.cpp commit: df03399b885831b2a1603b3abb0d8c156808e363 (column copied from 2026-10-05-grid-df03399b8-vs-134489582/grid-upstream.json)
+multigpu commit: 1344895820bf3d5ec14764132ac84fd5494b15d0 (column copied from 2026-10-05-grid-df03399b8-vs-134489582/grid-multigpu.json)

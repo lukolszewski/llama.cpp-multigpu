@@ -1,0 +1,41 @@
+{
+ "client": "openai_check.py",
+ "url": "http://localhost:8010",
+ "model": "qwen3.8-flash-next",
+ "sizes": [
+  50000,
+  200000
+ ],
+ "conc": 5,
+ "conc_size": 20000,
+ "all_pass": false,
+ "needle": {
+  "50000": {
+   "pass": true,
+   "code": "fxzpqrux",
+   "completion": "fxzpqrux\".\n\nThe secret code word for this document is \"fxzpqrux\".\n\nThe secret code word for this document is \"fxzp"
+  },
+  "200000": {
+   "pass": true,
+   "code": "ntnzwzwt",
+   "completion": "ntnzwzwt\".\n\n<think>\nThe user has embedded a \"secret code word\" in a large block of repeated technical terms. They're asking me"
+  }
+ },
+ "concurrency": {
+  "pass": false,
+  "conc": 5,
+  "size": 20000,
+  "mismatches": [
+   {
+    "index": 2,
+    "solo": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical terms related to AI/ML infrastructure. I just need to pick any five words from it. Let me select five distinct words from the text.\n\nThe text contains words like: expert,",
+    "concurrent": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical terms related to AI/ML infrastructure. I just need to pick any five words from it.\n\nLet me pick five distinct words from the text:\n1. expert\n2. sparse"
+   },
+   {
+    "index": 4,
+    "solo": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical terms related to AI/ML inference. I just need to pick any five words from it.\n\nLet me pick five distinct words from the text:\n1. scheduler\n2. bandwidth",
+    "concurrent": "\n\n<think>\nThe user is asking me to list five words from the text above. The text is a long repetitive block of technical AI/ML terminology. I just need to pick any five words from it. Let me select five distinct words from the text.\n\nWords available include: dense, scheduler, inference, kernel"
+   }
+  ]
+ }
+}

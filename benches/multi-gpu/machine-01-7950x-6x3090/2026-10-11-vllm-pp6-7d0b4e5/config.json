@@ -1,0 +1,331 @@
+{
+  "docker_run": "docker run -d --name vllm-pp6 --gpus \\\"device=0\\,1\\,2\\,3\\,4\\,5\\\" --ipc=host --shm-size 16g -p 8010:8010 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e HF_HUB_OFFLINE=1 -e VLLM_PP_LAYER_PARTITION=8\\,8\\,8\\,8\\,8\\,8 -v /home/luk/dev/ai/cache/qwen38-flash-next-gptq4:/model:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/model_executor/models/config.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/config.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/amd/model_state.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/amd/model_state.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/common/ngram_embedding.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/common/ngram_embedding.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/nvidia/model.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/model.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/nvidia/model_state.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/model_state.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/nvidia/qsa.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/qsa.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/v1/core/kv_cache_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py:ro vllm-pp6:7d0b4e57a /model --served-model-name qwen3.8-flash-next --dtype bfloat16 --pipeline-parallel-size 6 --tensor-parallel-size 1 --distributed-executor-backend mp --max-model-len 262144 --max-num-seqs 5 --gpu-memory-utilization 0.92 --engram-config \\{\\\"cpu_offload\\\":\\ true\\} --port 8010 --host 0.0.0.0 --trust-remote-code --no-enable-prefix-caching",
+  "image": "vllm-pp6:7d0b4e57a",
+  "image_digest": "sha256:eed859ad25fddc9ca83593fc315d5b0b63bfbe87b3fd0fd9499d2533c4e9cb8b",
+  "image_base": "vllm/vllm-openai:cu129-nightly @ 7d0b4e57a (torchcodec removed)",
+  "vllm_version": "0.31.1rc1.dev253+g7d0b4e57a",
+  "vllm_commit": "7d0b4e57a",
+  "torch": "2.13.0+cu129",
+  "patches": [
+    "overlay.diff in this directory (unified diff of the 7 overlaid files against the image originals)"
+  ],
+  "overlay_files": [
+    "overlay/vllm/model_executor/models/config.py",
+    "overlay/vllm/models/qwen4_exp/amd/model_state.py",
+    "overlay/vllm/models/qwen4_exp/common/ngram_embedding.py",
+    "overlay/vllm/models/qwen4_exp/nvidia/model.py",
+    "overlay/vllm/models/qwen4_exp/nvidia/model_state.py",
+    "overlay/vllm/models/qwen4_exp/nvidia/qsa.py",
+    "overlay/vllm/v1/core/kv_cache_utils.py"
+  ],
+  "env": {
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "HF_HUB_OFFLINE": "1",
+    "VLLM_PP_LAYER_PARTITION": "8,8,8,8,8,8"
+  },
+  "part": "VLLM_PP_LAYER_PARTITION=8,8,8,8,8,8 (pipeline_parallel_size 6, tensor_parallel_size 1, mp executor)",
+  "max_model_len": 262144,
+  "max_num_seqs": 5,
+  "kv_cache_dtype": "auto (bf16)",
+  "prefix_caching": false,
+  "engram_config": {
+    "cpu_offload": true
+  },
+  "checkpoint": {
+    "repo": "btbtyler09/Qwen3.8-Flash-Next-GPTQ-4bit",
+    "local": "/home/luk/dev/ai/cache/qwen38-flash-next-gptq4",
+    "files": [
+      [
+        ".gitattributes",
+        1635
+      ],
+      [
+        "LICENSE",
+        3235
+      ],
+      [
+        "README.md",
+        10310
+      ],
+      [
+        "chat_template.jinja",
+        8952
+      ],
+      [
+        "config.json",
+        5307
+      ],
+      [
+        "generation_config.json",
+        236
+      ],
+      [
+        "merges.txt",
+        3353259
+      ],
+      [
+        "model-00001-of-00021.safetensors",
+        4280376904
+      ],
+      [
+        "model-00002-of-00021.safetensors",
+        3574408496
+      ],
+      [
+        "model-00003-of-00021.safetensors",
+        4296375280
+      ],
+      [
+        "model-00004-of-00021.safetensors",
+        4296717048
+      ],
+      [
+        "model-00005-of-00021.safetensors",
+        4296716600
+      ],
+      [
+        "model-00006-of-00021.safetensors",
+        4297387360
+      ],
+      [
+        "model-00007-of-00021.safetensors",
+        4296837224
+      ],
+      [
+        "model-00008-of-00021.safetensors",
+        4296734480
+      ],
+      [
+        "model-00009-of-00021.safetensors",
+        4296734480
+      ],
+      [
+        "model-00010-of-00021.safetensors",
+        4297392832
+      ],
+      [
+        "model-00011-of-00021.safetensors",
+        4296837224
+      ],
+      [
+        "model-00012-of-00021.safetensors",
+        4296734480
+      ],
+      [
+        "model-00013-of-00021.safetensors",
+        4296734920
+      ],
+      [
+        "model-00014-of-00021.safetensors",
+        4297401000
+      ],
+      [
+        "model-00015-of-00021.safetensors",
+        4296837392
+      ],
+      [
+        "model-00016-of-00021.safetensors",
+        4296734480
+      ],
+      [
+        "model-00017-of-00021.safetensors",
+        4297400520
+      ],
+      [
+        "model-00018-of-00021.safetensors",
+        4296837224
+      ],
+      [
+        "model-00019-of-00021.safetensors",
+        3472633032
+      ],
+      [
+        "model-00020-of-00021.safetensors",
+        3355443352
+      ],
+      [
+        "model-00021-of-00021.safetensors",
+        1832523968
+      ],
+      [
+        "model.safetensors.index.json",
+        31454949
+      ],
+      [
+        "ple-00001.safetensors",
+        1600008032
+      ],
+      [
+        "ple-00002.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00003.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00004.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00005.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00006.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00007.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00008.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00009.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00010.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00011.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00012.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00013.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00014.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00015.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00016.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00017.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00018.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00019.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00020.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00021.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00022.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00023.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00024.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00025.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00026.safetensors",
+        3200016032
+      ],
+      [
+        "ple-00027.safetensors",
+        3200016040
+      ],
+      [
+        "ple-00028.safetensors",
+        3200016040
+      ],
+      [
+        "ple-00029.safetensors",
+        3200016040
+      ],
+      [
+        "ple-00030.safetensors",
+        3200016040
+      ],
+      [
+        "ple-00031.safetensors",
+        3200016040
+      ],
+      [
+        "ple-00032.safetensors",
+        3200016040
+      ],
+      [
+        "ple-00033.safetensors",
+        1600008032
+      ],
+      [
+        "preprocessor_config.json",
+        390
+      ],
+      [
+        "quant_log.csv",
+        4221997
+      ],
+      [
+        "quantize.py",
+        15820
+      ],
+      [
+        "quantize_config.json",
+        1161
+      ],
+      [
+        "tokenizer.json",
+        19989325
+      ],
+      [
+        "tokenizer_config.json",
+        1124
+      ],
+      [
+        "video_preprocessor_config.json",
+        385
+      ],
+      [
+        "vocab.json",
+        6722759
+      ]
+    ]
+  },
+  "measured": "2026-10-11 (grid-vllm.json)",
+  "gpus": "6 x RTX 3090 (GPUs 0-5, one pipeline stage each; GPU 6 RTX 5060 Ti unused), AMD 7950X, 187 GB RAM",
+  "notes": [
+    "Pipeline parallelism (PP=6, one 8-layer stage per GPU) over 6x RTX 3090 (PCIe: GPU0/1 Gen4 x8, GPU2-5 behind Thunderbolt); the upstream nightly refuses PP for this model, the overlay removes the guards and fixes GPTQ loading and KV-cache allocation under PP",
+    "PLE n-gram table (102 GB BF16) host-offloaded via --engram-config cpu_offload: container RSS ~143 GB, 20 GB swap in use during the run \u2014 host RAM is the binding constraint",
+    "KV cache 1,016,755 tokens total (bf16) \u2192 3.88 concurrent 262k sequences; 5 x 250k prompts exceed it, so the 5-session 250k row includes queueing",
+    "Correctness: needle-in-haystack at 50k and 200k passed; byte-equality of 5 concurrent vs solo greedy completions FAILS (outputs identical for the first ~30-40 tokens then diverge in wording, coherent) \u2014 batch-composition nondeterminism, not corruption; same result with max_num_seqs=2; prefix caching ON (max_num_seqs=5) also passed the needle checks and showed the same nondeterminism (2 of 5 differ); grid run with prefix caching OFF",
+    "Load time: model healthy 376-468 s after container start over four starts (weights ~86 s, the rest is engine init and compilation) vs ~2-3 min for llama.cpp",
+    "GPU 6 (RTX 5060 Ti) unused by vLLM; production llama.cpp server stopped for the duration of the window",
+    "5-session generate rows are not like-for-like with llama.cpp: the OpenAI client sends one streaming request per session, so generation is timed from each session's first token to its last; the first session to finish prefill decodes while the other four are still prefilling (chunked prefill shares every step), its decode crawls and the aggregate window spans the remaining prefill \u2014 llama.cpp's 5-slot generate was measured with all slots already cached and decoding together"
+  ]
+}
