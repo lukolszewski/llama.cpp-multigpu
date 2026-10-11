@@ -192,6 +192,65 @@ Units: tokens/s (aggregate for the 5-slot rows; per-slot values recorded alongsi
 reported as a ratio **and** absolute delta, since a 2x on a bad baseline and a 1.2x on a good one mean
 different things to different users.
 
+### machine-01 - vLLM pipeline-parallel column
+
+```
+vllm:             0.31.1rc1.dev253+g7d0b4e57a (commit 7d0b4e57a)
+image:            vllm-pp6:7d0b4e57a  digest sha256:eed859ad25fddc9ca83593fc315d5b0b63bfbe87b3fd0fd9499d2533c4e9cb8b
+run:              docker run -d --name vllm-pp6 --gpus "device=0,1,2,3,4,5" --ipc=host --shm-size 16g -p 8010:8010 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e HF_HUB_OFFLINE=1 -e VLLM_PP_LAYER_PARTITION=8,8,8,8,8,8 -v /home/luk/dev/ai/cache/qwen38-flash-next-gptq4:/model:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/model_executor/models/config.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/config.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/amd/model_state.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/amd/model_state.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/common/ngram_embedding.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/common/ngram_embedding.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/nvidia/model.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/model.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/nvidia/model_state.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/model_state.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/models/qwen4_exp/nvidia/qsa.py:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/qsa.py:ro -v /home/luk/dev/airun/vllm-pp6/work/T1-patches/overlay/vllm/v1/core/kv_cache_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py:ro vllm-pp6:7d0b4e57a /model --served-model-name qwen3.8-flash-next --dtype bfloat16 --pipeline-parallel-size 6 --tensor-parallel-size 1 --distributed-executor-backend mp --max-model-len 262144 --max-num-seqs 5 --gpu-memory-utilization 0.92 --engram-config {"cpu_offload": true} --port 8010 --host 0.0.0.0 --trust-remote-code --no-enable-prefix-caching
+pipeline:         part=VLLM_PP_LAYER_PARTITION=8,8,8,8,8,8 (pipeline_parallel_size 6, tensor_parallel_size 1, mp executor); max_model_len=262144; max_num_seqs=5; kv_cache_dtype=auto (bf16); prefix_caching=false
+patches:          overlay.diff in this directory (unified diff of the 7 overlaid files against the image originals)
+overlay files:    overlay/vllm/model_executor/models/config.py, overlay/vllm/models/qwen4_exp/amd/model_state.py, overlay/vllm/models/qwen4_exp/common/ngram_embedding.py, overlay/vllm/models/qwen4_exp/nvidia/model.py, overlay/vllm/models/qwen4_exp/nvidia/model_state.py, overlay/vllm/models/qwen4_exp/nvidia/qsa.py, overlay/vllm/v1/core/kv_cache_utils.py
+env:              CUDA_DEVICE_ORDER=PCI_BUS_ID HF_HUB_OFFLINE=1 VLLM_PP_LAYER_PARTITION=8,8,8,8,8,8
+checkpoint:       btbtyler09/Qwen3.8-Flash-Next-GPTQ-4bit (70 files, 188 GB = 175 GiB; per-file sizes in config.json)
+measured:         2026-10-11 (grid-vllm.json)
+gpus:             6 x RTX 3090 (GPUs 0-5, one pipeline stage each; GPU 6 RTX 5060 Ti unused), AMD 7950X, 187 GB RAM
+raw data:         benches/multi-gpu/machine-01-7950x-6x3090/2026-10-11-vllm-pp6-7d0b4e5/
+vllm commit: 7d0b4e57a (vllm 0.31.1rc1.dev253+g7d0b4e57a, torch 2.13.0+cu129; base image vllm/vllm-openai:cu129-nightly as of 2026-10-10)
+vllm image: vllm-pp6:7d0b4e57a (local derivative: base image with torchcodec removed; Id sha256:eed859ad25fddc9ca83593fc315d5b0b63bfbe87b3fd0fd9499d2533c4e9cb8b, not pushed)
+vllm patches: 7 Python files bind-mounted over /usr/local/lib/python3.12/dist-packages (overlay.diff in this directory; file list in config.json overlay_files)
+checkpoint: btbtyler09/Qwen3.8-Flash-Next-GPTQ-4bit (GPTQ 4-bit g32 Linear-only, 70 files, 188 GB (175 GiB); PLE table / indexer / linear_attn / norms BF16)
+upstream llama.cpp commit: df03399b885831b2a1603b3abb0d8c156808e363 (column copied from 2026-10-05-grid-df03399b8-vs-134489582/grid-upstream.json)
+multigpu commit: 1344895820bf3d5ec14764132ac84fd5494b15d0 (column copied from 2026-10-05-grid-df03399b8-vs-134489582/grid-multigpu.json)
+```
+
+| Workload | Context | Upstream llama.cpp | llama.cpp-multigpu | vLLM-PP (patched) | multigpu vs upstream | multigpu vs vLLM |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 slot - prefill | 5k | 715 | 1249 | 4028 | 1.75x (+534 t/s) | 0.31x (-2778 t/s) |
+| 1 slot - generate | 5k | 38.5 | 45.9 | 55.9 | 1.19x (+7.4 t/s) | 0.82x (-10.0 t/s) |
+| 1 slot - prefill | 50k | 568 | 2127 | 8365 | 3.75x (+1560 t/s) | 0.25x (-6238 t/s) |
+| 1 slot - generate | 50k | 25.7 | 41.9 | 57.6 | 1.63x (+16.2 t/s) | 0.73x (-15.7 t/s) |
+| 1 slot - prefill | 150k | 368 | 2152 | 9220 | 5.86x (+1785 t/s) | 0.23x (-7068 t/s) |
+| 1 slot - generate | 150k | 14.1 | 37.8 | 58.8 | 2.69x (+23.7 t/s) | 0.64x (-21.0 t/s) |
+| 1 slot - prefill | 200k | 315 | 2122 | 9235 | 6.73x (+1806 t/s) | 0.23x (-7113 t/s) |
+| 1 slot - generate | 200k | 11.9 | 36.6 | 59.0 | 3.07x (+24.7 t/s) | 0.62x (-22.4 t/s) |
+| 1 slot - prefill | 250k | 263 | 2111 | 9046 | 8.02x (+1848 t/s) | 0.23x (-6935 t/s) |
+| 1 slot - generate | 250k | 10.2 | 33.7 | 57.8 | 3.29x (+23.5 t/s) | 0.58x (-24.1 t/s) |
+| 5 slots - concurrent - prefill | 5k | 630 (388/slot) | 2120 (681/slot) | 6208 (2192/slot) | 3.37x (+1491 t/s) | 0.34x (-4088 t/s) |
+| 5 slots - concurrent - generate | 5k | 77.3 (18.2/slot) | 175.2 (42.3/slot) | 107.9 (31.2/slot) | 2.27x (+97.9 t/s) | 1.62x (+67.4 t/s) |
+| 5 slots - concurrent - prefill | 50k | 574 (526/slot) | 2301 (1511/slot) | 8452 (3872/slot) | 4.01x (+1727 t/s) | 0.27x (-6151 t/s) |
+| 5 slots - concurrent - generate | 50k | 34.8 (8.1/slot) | 153.3 (38.3/slot) | 24.2 (15.2/slot) | 4.41x (+118.5 t/s) | 6.33x (+129.1 t/s) |
+| 5 slots - concurrent - prefill | 150k | 363 (353/slot) | 2251 (1993/slot) | 8203 (3752/slot) | 6.20x (+1888 t/s) | 0.27x (-5952 t/s) |
+| 5 slots - concurrent - generate | 150k | 15.8 (3.6/slot) | 123.1 (32.4/slot) | 8.5 (11.2/slot) | 7.78x (+107.2 t/s) | 14.43x (+114.5 t/s) |
+| 5 slots - concurrent - prefill | 200k | 307 (300/slot) | 2180 (1977/slot) | 8533 (3882/slot) | 7.11x (+1873 t/s) | 0.26x (-6354 t/s) |
+| 5 slots - concurrent - generate | 200k | 11.6 (2.8/slot) | 105.9 (29.0/slot) | 6.7 (10.3/slot) | 9.13x (+94.3 t/s) | 15.78x (+99.2 t/s) |
+| 5 slots - concurrent - prefill | 250k | 265 (261/slot) | 2060 (1928/slot) | 8111 (3899/slot) | 7.77x (+1795 t/s) | 0.25x (-6051 t/s) |
+| 5 slots - concurrent - generate | 250k | 9.1 (2.3/slot) | 98.0 (27.3/slot) | 5.0 (12.6/slot) | 10.79x (+88.9 t/s) | 19.44x (+92.9 t/s) |
+
+Caveats:
+
+- Pipeline parallelism (PP=6, one 8-layer stage per GPU) over 6x RTX 3090 (PCIe: GPU0/1 Gen4 x8, GPU2-5 behind Thunderbolt); the upstream nightly refuses PP for this model, the overlay removes the guards and fixes GPTQ loading and KV-cache allocation under PP
+- PLE n-gram table (102 GB BF16) host-offloaded via --engram-config cpu_offload: container RSS ~143 GB, 20 GB swap in use during the run — host RAM is the binding constraint
+- KV cache 1,016,755 tokens total (bf16) → 3.88 concurrent 262k sequences; 5 x 250k prompts exceed it, so the 5-session 250k row includes queueing
+- Correctness: needle-in-haystack at 50k and 200k passed; byte-equality of 5 concurrent vs solo greedy completions FAILS (outputs identical for the first ~30-40 tokens then diverge in wording, coherent) — batch-composition nondeterminism, not corruption; same result with max_num_seqs=2; prefix caching ON (max_num_seqs=5) also passed the needle checks and showed the same nondeterminism (2 of 5 differ); grid run with prefix caching OFF
+- Load time: model healthy 376-468 s after container start over four starts (weights ~86 s, the rest is engine init and compilation) vs ~2-3 min for llama.cpp
+- GPU 6 (RTX 5060 Ti) unused by vLLM; production llama.cpp server stopped for the duration of the window
+- 5-session generate rows are not like-for-like with llama.cpp: the OpenAI client sends one streaming request per session, so generation is timed from each session's first token to its last; the first session to finish prefill decodes while the other four are still prefilling (chunked prefill shares every step), its decode crawls and the aggregate window spans the remaining prefill — llama.cpp's 5-slot generate was measured with all slots already cached and decoding together
+- vLLM is upstream 7d0b4e57a + 7 overlaid Python files, see overlay.diff in this directory — no PP-capable release exists for this model
+- prefix caching off for the grid
+- KV cache dtype: auto (bf16)
+- one streaming request per cell; prefill t/s = prompt_tokens/TTFT, generation t/s from inter-token time (the llama.cpp columns use the server's own timings)
+
 ### rented machines
 
 Sections are appended here by `scripts/multigpu/bench/vast/vast-bench.sh land` (one per machine, same
