@@ -1,0 +1,92 @@
+{
+ "client": "readme_grid_openai.py",
+ "label": "vllm-fp8",
+ "url": "http://localhost:8010",
+ "gen_tokens": 128,
+ "rows": [
+  {
+   "slots": 1,
+   "size_tokens": 5000,
+   "gpu_before": "44, 205.84;44, 208.67;66, 230.50;60, 214.40;66, 222.68;62, 255.11;49, 27.07",
+   "t_start": "14:48:34",
+   "pp_agg": 1314.4,
+   "pp_slot_min": 1314.4,
+   "pp_slot_mean": 1314.4,
+   "pp_slot_max": 1314.4,
+   "prompt_n": [
+    4995
+   ],
+   "ttft_min": 3.8,
+   "ttft_max": 3.8,
+   "pp_wall": 3.8,
+   "tg_agg": 54.73,
+   "tg_slot_min": 54.31,
+   "tg_slot_max": 54.31,
+   "tg_slot_mean": 54.31,
+   "prompt_n_round2": [
+    4995
+   ],
+   "tg_wall": 2.3,
+   "texts": [
+    "\n\n<think>\nThe user's message is a massive block of repeated technical terms rela"
+   ],
+   "gpu_after": "43, 179.88;43, 185.78;65, 199.02;60, 203.00;64, 194.35;60, 211.26;50, 27.29"
+  },
+  {
+   "slots": 1,
+   "size_tokens": 50000,
+   "gpu_before": "43, 179.88;43, 185.78;65, 199.02;60, 203.00;64, 194.35;60, 211.26;50, 27.39",
+   "t_start": "14:48:40",
+   "pp_agg": 2227.1,
+   "pp_slot_min": 2227.1,
+   "pp_slot_mean": 2227.1,
+   "pp_slot_max": 2227.1,
+   "prompt_n": [
+    49681
+   ],
+   "ttft_min": 22.3,
+   "ttft_max": 22.3,
+   "pp_wall": 22.3,
+   "tg_agg": 55.27,
+   "tg_slot_min": 54.84,
+   "tg_slot_max": 54.84,
+   "tg_slot_mean": 54.84,
+   "prompt_n_round2": [
+    49681
+   ],
+   "tg_wall": 2.3,
+   "texts": [
+    "\n\n<think>\nThe user's message is an extremely long, repetitive block of text that"
+   ],
+   "gpu_after": "44, 180.11;43, 185.72;65, 199.40;60, 203.17;64, 194.41;60, 211.47;52, 27.81"
+  },
+  {
+   "slots": 1,
+   "size_tokens": 250000,
+   "gpu_before": "43, 179.99;42, 182.48;65, 199.40;60, 203.17;64, 189.90;59, 204.57;52, 27.91",
+   "t_start": "14:49:05",
+   "pp_agg": 177257.0,
+   "pp_slot_min": 177257.0,
+   "pp_slot_mean": 177257.0,
+   "pp_slot_max": 177257.0,
+   "prompt_n": [
+    248281
+   ],
+   "ttft_min": 1.4,
+   "ttft_max": 1.4,
+   "pp_wall": 1.4,
+   "tg_agg": 55.58,
+   "tg_slot_min": 55.14,
+   "tg_slot_max": 55.14,
+   "tg_slot_mean": 55.14,
+   "prompt_n_round2": [
+    248281
+   ],
+   "tg_wall": 2.3,
+   "texts": [
+    "\n\n<think>\nThe user's message is an extremely long, repetitive block of text that"
+   ],
+   "gpu_after": "43, 179.97;43, 185.88;64, 198.23;59, 201.78;63, 193.82;60, 210.65;52, 28.02"
+  }
+ ]
+}

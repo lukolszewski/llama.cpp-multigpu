@@ -251,6 +251,25 @@ Caveats:
 - KV cache dtype: auto (bf16)
 - one streaming request per cell; prefill t/s = prompt_tokens/TTFT, generation t/s from inter-token time (the llama.cpp columns use the server's own timings)
 
+#### fp8 KV follow-up (2026-10-11, raw data 2026-10-11-vllm-pp6-fp8-665cb59/)
+
+`--kv-cache-dtype fp8` did not run on the 3090s (Triton has no e4m3 conversion on sm < 89); four more overlaid files
+(fork commits up to 665cb59fc, `overlay.diff` in that directory) convert e4m3 in software on Ampere. Same image, same
+box, prefix caching ON, max-num-seqs 5:
+
+| Measure | bf16 KV (table above) | fp8 KV |
+| --- | --- | --- |
+| GPU KV cache | 1,016,755 tokens (3.88 x 262k) | 1,835,008 tokens (7.00 x 262k) |
+| 5 x 250k sessions | queueing (4 resident) | all 5 resident, peak KV usage 67.8% |
+| 1 slot generate 5k / 50k / 250k | 55.9 / 57.6 / 57.8 t/s | 54.7 / 55.3 / 55.6 t/s |
+| 1 slot prefill 5k / 50k | 4028 / 8365 t/s | 1314 / 2227 t/s (see note) |
+| needle 50k / 200k | PASS / PASS | PASS / PASS |
+| VRAM per GPU after 5 x 250k | - | 22.1-22.9 GiB |
+
+Note: the fp8 1-slot prefill numbers were taken right after the 5-session run with prefix caching on (the 250k prompt
+was fully cached, TTFT 1.4 s) and in a single 20-minute window, so they are not a clean prefill measurement; the decode
+numbers are. The software e4m3 path is unit-tested bitwise against the native conversion (tests in that directory).
+
 ### rented machines
 
 Sections are appended here by `scripts/multigpu/bench/vast/vast-bench.sh land` (one per machine, same

@@ -1,0 +1,484 @@
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 7f6a3aef4..6850137ea 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -926,14 +926,17 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
+             raise NotImplementedError(
+                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
+             )
+-        # Checked again in Qwen4ExpModelState; rejecting it here keeps the
+-        # engine from loading weights first.
++        # vllm-pp6 overlay: PP>1 is allowed; the PLE layer must stay on stage 0,
++        # which VLLM_PP_LAYER_PARTITION guarantees (checked in the
++        # Qwen4ExpModelState overlay). Only require that the partition is set.
+         if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
+-            raise NotImplementedError(
+-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
+-                "because non-first pipeline ranks do not receive the raw input_ids "
+-                "it needs. Please run with PP=1."
+-            )
++            import os
++
++            if not os.environ.get("VLLM_PP_LAYER_PARTITION"):
++                raise NotImplementedError(
++                    "vllm-pp6: PP>1 with PLE needs VLLM_PP_LAYER_PARTITION set "
++                    "(first entry must exceed max(ple_layer_ids)-1)"
++                )
+         multimodal_config = vllm_config.model_config.multimodal_config
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+diff --git a/vllm/models/qwen4_exp/amd/model_state.py b/vllm/models/qwen4_exp/amd/model_state.py
+index ec2a0fef8..1b2a1c80d 100644
+--- a/vllm/models/qwen4_exp/amd/model_state.py
++++ b/vllm/models/qwen4_exp/amd/model_state.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Model-runner state for Qwen4Exp PLE inputs."""
+ 
++import os
+ from typing import Any
+ 
+ import torch
+@@ -32,13 +33,22 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             self.ngram_eos_token_id = 0
+             return
+ 
++        # vllm-pp6 overlay (port of alanoo81 flashnext-v620-pp3 patch 0001):
++        # allow PP>1; the PLE layer must stay on the first pipeline stage,
++        # which receives the raw input_ids. Enforced by VLLM_PP_LAYER_PARTITION.
+         if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++            first_stage_layers = None
++            part = os.environ.get("VLLM_PP_LAYER_PARTITION")
++            if part:
++                first_stage_layers = int(part.split(",")[0])
++            if first_stage_layers is not None and first_stage_layers <= max(
++                config.ple_layer_ids
++            ) - 1:
++                raise RuntimeError(
++                    "PLE layer must be on pipeline stage 0: first entry of "
++                    "VLLM_PP_LAYER_PARTITION must exceed "
++                    f"max(ple_layer_ids)-1={max(config.ple_layer_ids)-1}"
++                )
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff --git a/vllm/models/qwen4_exp/common/ngram_embedding.py b/vllm/models/qwen4_exp/common/ngram_embedding.py
+index 6dad6b7b5..8f2262bc6 100644
+--- a/vllm/models/qwen4_exp/common/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/common/ngram_embedding.py
+@@ -162,6 +162,10 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
+         raise NotImplementedError
+ 
+ 
++# vllm-pp6 overlay: quant configs whose checkpoints leave the PLE table unquantized.
++_GPTQ_CONFIG_NAMES = frozenset({"AutoGPTQConfig", "GPTQConfig", "GPTQMarlinConfig"})
++
++
+ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+     """Quantization interface shared by resident and pinned PLE tables."""
+ 
+@@ -179,6 +183,10 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+             return Qwen4ExpPLEFp8EmbeddingMethod()
+         if quant_config is None:
+             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++        # vllm-pp6 overlay: GPTQ checkpoints (gptqmodel) quantize Linear layers only;
++        # the PLE n-gram table shards stay BF16, so use the unquantized method.
++        if type(quant_config).__name__ in _GPTQ_CONFIG_NAMES:
++            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+         if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+             if quant_config._resolve_quant_algo(prefix) == "FP8":
+                 return Qwen4ExpPLEFp8EmbeddingMethod()
+diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+index c8ffa0dbf..70a4cbe07 100644
+--- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+@@ -21,6 +21,7 @@ from ..common.qsa_cache import (
+     QSAKeyStateCache,
+     canonical_qsa_rope_positions,
+ )
++from .ops.fp8_ampere import emulate_e4m3
+ from .ops.qsa_prepare import qsa_prepare
+ 
+ if TYPE_CHECKING:
+@@ -305,7 +306,8 @@ class QSAIndexer(nn.Module):
+                 dtype=self.indexer_dtype,
+             )
+             main_kv_cache = attn.kv_cache.transpose(1, 2)
+-            if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
++            if attn.kv_cache_dtype in ("fp8", "fp8_e4m3") and not emulate_e4m3():
++                # Under emulation the uint8 storage is passed as is.
+                 main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
+             main_outputs = qsa_prepare(
+                 projected_q,
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 2de883cc4..487d0343b 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -158,6 +158,15 @@ _EXTRA_WEIGHTS_MAPPER = WeightsMapper(
+ )
+ 
+ 
++def _is_gptq(quant_config) -> bool:
++    """vllm-pp6 overlay: GPTQ-family quant configs (Linear-only quantization)."""
++    return type(quant_config).__name__ in (
++        "AutoGPTQConfig",
++        "GPTQConfig",
++        "GPTQMarlinConfig",
++    )
++
++
+ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
+     """Qwen3Next MoE with Qwen4Exp HC validation."""
+ 
+@@ -641,12 +650,20 @@ class Qwen4ExpForCausalLM(
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+-        if vllm_config.lora_config is not None:
++        if vllm_config.lora_config is not None or _is_gptq(vllm_config.quant_config):
+             # LoRA does not support the merged QKV/indexer projection, so its
+             # packed mapping must keep the indexer separate.
++            # vllm-pp6 overlay: same for GPTQ checkpoints, where q/k/v_proj are
++            # quantized but indexer.index_qk_proj is BF16 (see qsa.py).
+             self.packed_modules_mapping = self.packed_modules_mapping | {
+                 "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+             }
++            if vllm_config.quant_config is not None:
++                # configure_quant_config() copied the class-level mapping before
++                # __init__ ran; the fused-shard check must see this one.
++                vllm_config.quant_config.packed_modules_mapping = (
++                    self.packed_modules_mapping
++                )
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+         self.quant_config = vllm_config.quant_config
+@@ -890,12 +907,20 @@ class Qwen4ExpForConditionalGeneration(
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
+         nn.Module.__init__(self)
+         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
+-        if vllm_config.lora_config is not None:
++        if vllm_config.lora_config is not None or _is_gptq(vllm_config.quant_config):
+             # LoRA does not support the merged QKV/indexer projection, so its
+             # packed mapping must keep the indexer separate.
++            # vllm-pp6 overlay: same for GPTQ checkpoints, where q/k/v_proj are
++            # quantized but indexer.index_qk_proj is BF16 (see qsa.py).
+             self.packed_modules_mapping = self.packed_modules_mapping | {
+                 "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+             }
++            if vllm_config.quant_config is not None:
++                # configure_quant_config() copied the class-level mapping before
++                # __init__ ran; the fused-shard check must see this one.
++                vllm_config.quant_config.packed_modules_mapping = (
++                    self.packed_modules_mapping
++                )
+         quant_config = vllm_config.quant_config
+         multimodal_config = vllm_config.model_config.multimodal_config
+         if multimodal_config is None:
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 246168509..97af8a580 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Model-runner state for Qwen4Exp PLE inputs."""
+ 
++import os
+ from typing import Any
+ 
+ import torch
+@@ -32,13 +33,22 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             self.ngram_eos_token_id = 0
+             return
+ 
++        # vllm-pp6 overlay (port of alanoo81 flashnext-v620-pp3 patch 0001):
++        # allow PP>1; the PLE layer must stay on the first pipeline stage,
++        # which receives the raw input_ids. Enforced by VLLM_PP_LAYER_PARTITION.
+         if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++            first_stage_layers = None
++            part = os.environ.get("VLLM_PP_LAYER_PARTITION")
++            if part:
++                first_stage_layers = int(part.split(",")[0])
++            if first_stage_layers is not None and first_stage_layers <= max(
++                config.ple_layer_ids
++            ) - 1:
++                raise RuntimeError(
++                    "PLE layer must be on pipeline stage 0: first entry of "
++                    "VLLM_PP_LAYER_PARTITION must exceed "
++                    f"max(ple_layer_ids)-1={max(config.ple_layer_ids)-1}"
++                )
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/fp8_ampere.py b/vllm/models/qwen4_exp/nvidia/ops/fp8_ampere.py
+new file mode 100644
+index 000000000..40966d86b
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ops/fp8_ampere.py
+@@ -0,0 +1,89 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Software fp8 e4m3fn conversion for GPUs whose Triton backend has no native
++e4m3 cast (NVIDIA sm < 89, e.g. Ampere / RTX 3090).
++
++Triton 3.x supports only ``fp8e5`` and ``fp8e4b15`` on sm < 89, so any
++``.to(tl.float8e4nv)`` in the QSA kernels fails at compile time. On such GPUs
++the fp8 KV cache keeps the e4m3fn *byte format* (identical to Ada/Hopper), but
++the Triton kernels receive the cache as ``uint8`` and convert with the integer
++helpers below. Both helpers are bit-exact with PyTorch's e4m3fn conversion
++(round-to-nearest-even, saturate to +-448, NaN -> 0x7F | sign).
++
++The dtype of the pointer handed to the kernel selects the path at Triton
++compile time; no extra constexpr is needed.
++"""
++
++import os
++from functools import lru_cache
++
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++
++# fp32 bit patterns used by f32_to_e4m3_bits
++_F32_448 = 0x43E00000  # 448.0f  (largest finite e4m3fn)
++_F32_2P14 = 0x46800000  # 16384.0f (2^14)
++_F32_MIN_NORMAL = 0x3C800000  # 2^-6 (smallest e4m3fn normal)
++_F32_REBIAS = 0x3C000000  # (127 - 7) << 23
++_F32_INF = 0x7F800000
++
++
++@lru_cache(maxsize=1)
++def emulate_e4m3() -> bool:
++    """True when the e4m3 conversions must be emulated in software.
++
++    ``VLLM_QSA_EMULATE_E4M3=1`` / ``=0`` forces the decision (tests);
++    otherwise emulate on NVIDIA compute capability < 8.9.
++    """
++    v = os.environ.get("VLLM_QSA_EMULATE_E4M3")
++    if v is not None:
++        return v == "1"
++    cap = current_platform.get_device_capability()
++    return cap is not None and cap.to_int() < 89
++
++
++@triton.jit
++def f32_to_e4m3_bits(x):
++    """fp32 (any float input) -> e4m3fn code as uint8.
++
++    Round-to-nearest-even, saturating: |x| >= 448 (incl. inf) -> 0x7E,
++    NaN -> 0x7F (sign kept), |x| < 2^-10 -> +-0 (ties to even).
++    Bit-exact with ``torch.Tensor.to(torch.float8_e4m3fn)``.
++    """
++    b = x.to(tl.float32).to(tl.uint32, bitcast=True)
++    sign = b & 0x80000000
++    a = b ^ sign  # |x| bits
++    is_nan = a > 0x7F800000
++    a = tl.minimum(a, 0x43E00000)  # clamp |x| to 448.0
++    # subnormal result (|x| < 2^-6): adding 2^14 makes fp32's own RNE land on
++    # multiples of 2^-9 (= one e4m3 subnormal step); the low mantissa bits of
++    # the sum are then the e4m3 code (0..7, or 8 == 2^-6 which is code 0x08).
++    sub = (a.to(tl.float32, bitcast=True) + 16384.0).to(tl.uint32, bitcast=True) - 0x46800000
++    # normal result: rebias exponent 127 -> 7, RNE on the 20 dropped mantissa
++    # bits (round bit + sticky via +0x7FFFF, tie -> even via the lsb that stays)
++    odd = (a >> 20) & 1
++    nrm = (a - 0x3C000000 + 0x7FFFF + odd) >> 20
++    r = tl.where(a < 0x3C800000, sub, nrm)
++    r = tl.where(is_nan, 0x7F, r)
++    return (r | (sign >> 24)).to(tl.uint8)
++
++
++@triton.jit
++def e4m3_bits_to_f16(b):
++    """e4m3fn code (uint8) -> fp16 value; exact for every code.
++
++    Normals: fp16 exponent = e + 8 (bias 7 -> 15), mantissa shifted 3 -> 10
++    bits. Subnormals (e == 0): m * 2^-9. Codes 0x7F / 0xFF -> NaN.
++    """
++    c = b.to(tl.uint16)
++    s = (c & 0x80) << 8
++    e = (c >> 3) & 0xF
++    m = c & 0x7
++    nrm = (s | ((e + 8) << 10) | (m << 7)).to(tl.float16, bitcast=True)
++    # subnormal: m * 2^-9 is exact in fp16; apply the sign through the bits so
++    # that -0.0 (code 0x80) keeps its sign (a float negation would fold it).
++    sub = (m.to(tl.float32) * 0.001953125).to(tl.float16)
++    sub = (sub.to(tl.uint16, bitcast=True) | s).to(tl.float16, bitcast=True)
++    nan = (s | 0x7E00).to(tl.float16, bitcast=True)  # quiet NaN, sign kept
++    r = tl.where(e == 0, sub, nrm)
++    return tl.where((e == 15) & (m == 7), nan, r)
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 401048e02..223f9f55c 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -12,6 +12,10 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     TritonWarmupTensor,
+     triton_scalar_specialization_rep,
+ )
++from vllm.models.qwen4_exp.nvidia.ops.fp8_ampere import (
++    e4m3_bits_to_f16,
++    emulate_e4m3,
++)
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import HAS_TRITON, tl, triton
+ 
+@@ -152,8 +156,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+         )
+         if IS_FP8:
+             # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
+-            # measured slower here and less accurate).
+-            keys = keys.to(query.dtype)
++            # measured slower here and less accurate). On sm < 89 the cache
++            # arrives as uint8 e4m3 codes and is decoded in software.
++            if keys.dtype == tl.uint8:
++                keys = e4m3_bits_to_f16(keys).to(query.dtype)
++            else:
++                keys = keys.to(query.dtype)
+         scores = tl.dot(query, keys)
+         # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
+         # caches the K dequant scale is already folded into softmax_scale on the
+@@ -169,7 +177,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+             # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
+             # softmax) so fp16 has the range, its wider mantissa is more
+             # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
+-            values = values.to(tl.float16)
++            # Under software emulation the codes are uint8 and decode to fp16.
++            if values.dtype == tl.uint8:
++                values = e4m3_bits_to_f16(values)
++            else:
++                values = values.to(tl.float16)
+         accumulator = tl.dot(
+             probabilities.to(values.dtype),
+             values,
+@@ -636,7 +648,8 @@ def qsa_sparse_paged_attention(
+     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+     assert q.dtype == torch.bfloat16
+     assert k_cache.dtype == v_cache.dtype
+-    is_fp8 = k_cache.dtype == torch.float8_e4m3fn
++    # uint8 == the same e4m3fn bytes, converted in software (sm < 89).
++    is_fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.uint8)
+     if is_fp8:
+         assert k_scale is not None and v_scale is not None
+         # Host pre-multiply: fold the K dequant scale into the attention scale
+@@ -770,7 +783,11 @@ def warmup_qsa_sparse_paged_attention(
+     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+     # An fp8 cache is allocated as uint8 and viewed as e4m3 at attention time.
+     is_fp8 = kv_cache.dtype == torch.uint8
+-    cache_dtype = torch.float8_e4m3fn if is_fp8 else key_cache.dtype
++    cache_dtype = (
++        (torch.uint8 if emulate_e4m3() else torch.float8_e4m3fn)
++        if is_fp8
++        else key_cache.dtype
++    )
+     num_kv_heads = key_cache.shape[2]
+     group_size = num_query_heads // num_kv_heads
+     block_m = triton.next_power_of_2(group_size)
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py
+index a26b69965..c791bea77 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py
+@@ -4,6 +4,7 @@
+ 
+ import torch
+ 
++from vllm.models.qwen4_exp.nvidia.ops.fp8_ampere import f32_to_e4m3_bits
+ from vllm.triton_utils import tl, triton
+ 
+ 
+@@ -87,6 +88,8 @@ def _to_dst_dtype(x, dst, scale):
+     x = x.to(tl.bfloat16)
+     if out_ty == tl.float8e4nv:
+         x = x.to(tl.float32) / scale
++    elif out_ty == tl.uint8:  # Ampere: e4m3 emulated in software, cache uint8
++        return f32_to_e4m3_bits(x.to(tl.float32) / scale)
+     return x.to(out_ty)
+ 
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 0246db809..1ca086dba 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -61,6 +61,7 @@ from vllm.v1.kv_cache_interface import (
+ from ..common.qsa_cache import QSAForwardMetadata
+ from . import model
+ from .indexer_qsa import QSAIndexer
++from .ops.fp8_ampere import emulate_e4m3
+ 
+ 
+ class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
+@@ -295,11 +296,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+         token_to_req = token_to_req[:num_tokens]
+         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+         k_scale = v_scale = None
+-        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
++        is_fp8 = self.kv_cache_dtype in ("fp8", "fp8_e4m3")
++        if is_fp8:
+             # The cache is allocated as uint8; reinterpret the e4m3 bytes
+-            # (same itemsize, so shape and strides are preserved).
+-            key_cache = key_cache.view(torch.float8_e4m3fn)
+-            value_cache = value_cache.view(torch.float8_e4m3fn)
++            # (same itemsize, so shape and strides are preserved). On sm < 89
++            # (no Triton e4m3 cast) the uint8 view is passed as is and the
++            # kernels convert the codes in software.
++            if not emulate_e4m3():
++                key_cache = key_cache.view(torch.float8_e4m3fn)
++                value_cache = value_cache.view(torch.float8_e4m3fn)
+             # Host-side per-tensor dequant scales (Python floats), as used by
+             # other host-scale backends; folded into the kernel's scales.
+             k_scale = layer._k_scale_float
+@@ -307,7 +312,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+         if query.dtype != torch.bfloat16 or key_cache.dtype not in (
+             torch.bfloat16,
+             torch.float8_e4m3fn,
+-        ):
++        ) and not (is_fp8 and key_cache.dtype == torch.uint8):
+             raise NotImplementedError(
+                 "Qwen4Exp QSA requires BF16 Q and BF16 or FP8-e4m3 K/V"
+             )
+@@ -494,7 +499,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         self.use_fused_qsa_prepare = (
+             self.use_fused_qk_norm_rope_gate and self.indexer.use_fused_pre_indexer
+         )
+-        self.fuse_indexer_projection = vllm_config.lora_config is None
++        # vllm-pp6 overlay: GPTQ checkpoints quantize q/k/v_proj but keep
++        # indexer.index_qk_proj in BF16, so the shards cannot share one fused
++        # GPTQ layer; keep the indexer projection separate (as with LoRA).
++        self.fuse_indexer_projection = vllm_config.lora_config is None and (
++            type(quant_config).__name__
++            not in ("AutoGPTQConfig", "GPTQConfig", "GPTQMarlinConfig")
++        )
+         if self.fuse_indexer_projection:
+             self.index_qk_size = self.indexer.index_qk_proj.output_size
+             self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 919a7b4b3..d6d074be2 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1644,8 +1644,17 @@ def get_kv_cache_config_from_groups(
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
++            # vllm-pp6 overlay: under pipeline parallelism a group can be empty on
++            # this worker while still carrying the *global* UniformTypeKVCacheSpecs
++            # (see _project_kv_cache_groups_to_worker, which only rebuilds the spec
++            # when worker_layer_names is non-empty).  Iterating every layer of that
++            # spec puts other ranks' layers into this worker's KVCacheTensors and
++            # allocate_kv_cache() then fails with StopIteration looking the layer up
++            # in the worker's groups.  Only emit layers that live on this worker.
++            worker_layers = set(group.layer_names)
+             for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++                if layer_name in worker_layers:
++                    layers_by_spec[spec].append(layer_name)
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 

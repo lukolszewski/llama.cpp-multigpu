@@ -1,0 +1,9 @@
+665cb59fc PP-NVIDIA-QWEN.md: document the fp8 KV cache path for Ampere
+63b11ef6e qwen4_exp/nvidia/fp8_ampere: keep the sign of zero and NaN in e4m3_bits_to_f16
+9fdeb4e51 qwen4_exp/nvidia: use the software e4m3 path in the QSA kernels on sm < 89
+97d114e11 qwen4_exp/nvidia: software e4m3fn conversion helpers for Triton on sm < 89
+13b8b951e PP-NVIDIA-QWEN.md: relation to the earlier V620 fork, how to regenerate the overlay
+3e5bc34c9 Add PP-NVIDIA-QWEN.md: what this branch changes and how it was tested
+a64c61229 [Core] KV cache: only allocate a rank's own layers under pipeline parallelism
+7a4c81098 [Model] Qwen4Exp: load GPTQ checkpoints that quantize Linear layers only
+ac431c361 [Model] Qwen4Exp: allow pipeline parallelism when the PLE layer stays on stage 0
