@@ -113,6 +113,7 @@ Other machines (rented, one run each; same protocol, generated from the raw JSON
 | machine | GPUs | prefill, 1 session (t/s) | generation, concurrent sessions (t/s) | upstream measured | run |
 | --- | --- | --- | --- | --- | --- |
 | [machine-02-6x4090](benches/multi-gpu/machine-02-6x4090/hardware.md) | 6 of 8 × NVIDIA GeForce RTX 4090 (191 GB in the box) | 744 → 7403 (10.0×) at 250k | 30.8 per session, 5 sessions at 250k | yes | [2026-10-06-grid-df03399-vs-6a8a599](benches/multi-gpu/machine-02-6x4090/2026-10-06-grid-df03399-vs-6a8a599/) |
+| [machine-03-6xv100](benches/multi-gpu/machine-03-6xv100/hardware.md) | 6 of 8 × Tesla V100-SXM2-32GB (256 GB in the box) | 227 → 217 (1.0×) at 250k | 30.5 per session, 5 sessions at 50k | yes | [2026-10-07-grid-df03399-vs-79a12ee](benches/multi-gpu/machine-03-6xv100/2026-10-07-grid-df03399-vs-79a12ee/) |
 <!-- rented-machines:end -->
 
 ## 2. Hardware tested
@@ -145,7 +146,13 @@ with fast GPU interconnects, and results from different machines are never merge
 `machine-02` is a rented Vast.ai box: 8 × GeForce RTX 4090 (24 GB), of which six were used for a like-for-like
 layer split; Intel Xeon Platinum 8352V, 755 GiB RAM, PCIe Gen4 x8 per GPU, no NVLink, driver 570.211 (CUDA 12.8).
 Record: [benches/multi-gpu/machine-02-6x4090/hardware.md](benches/multi-gpu/machine-02-6x4090/hardware.md).
-Further machines (multi-5090, V100) get their own `machine-NN` directory and record, produced by the Vast.ai
+`machine-03` is a rented 8 × Tesla V100-SXM2 32 GB box (Vast.ai, Xeon Gold 6248, PCIe Gen3 x16), six cards used,
+driver 580. Volta has no integer tensor cores, so the quantized matmuls run on `dp4a` and **prefill is compute-bound
+on both builds** (~400 → ~220 t/s from 5k to 250k, 1.0–1.2× over upstream); the fork's gains there are on decode
+(27.2 vs 14.6 t/s at 150k single session, 1.9×; 30–35 t/s per session with five sessions). The deep five-session
+rows and the upstream rows beyond 150k were not run: at V100 prefill rates they cost hours.
+Record: [benches/multi-gpu/machine-03-6xv100/hardware.md](benches/multi-gpu/machine-03-6xv100/hardware.md).
+Further machines (multi-5090) get their own `machine-NN` directory and record, produced by the Vast.ai
 benchmark tooling in [scripts/multigpu/bench/vast/](scripts/multigpu/bench/vast/README.md); their rows appear
 in §1 only once a run exists.
 
