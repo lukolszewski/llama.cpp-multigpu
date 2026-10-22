@@ -2168,7 +2168,9 @@ static __global__ void flash_attn_ext_f16(
 #endif // VOLTA_MMA_AVAILABLE
 
 #if __CUDA_ARCH__ == GGML_CUDA_CC_TURING
-    if (ncols1*ncols2 > 32) {
+    // Upstream stops at 32 columns on Turing. GGML_CUDA_FA_TURING_COLS lets the host take a wider tile where its
+    // shared memory fits 64 KiB per SM; the 128-column shapes never do, so they stay out of the build.
+    if (ncols1*ncols2 > 64) {
         NO_DEVICE_CODE;
         return;
     }
