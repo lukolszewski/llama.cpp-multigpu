@@ -726,9 +726,10 @@ enum best_fattn_kernel {
 //   D=512:        a GQA ratio above 4 (8x8, 4x8, 2x8, 1x8).
 // The 128-column shapes (16x8, 64x2) exist at D=128 and D=256 only.
 // fattn-mma-quant-decl.cuh declares the same shapes. Turing takes half the columns of the wide shapes,
-// like switch_ncols1(). Every condition here answers "is a kernel compiled for this": the caller opted in.
+// like switch_ncols1(), unless GGML_CUDA_FA_TURING_COLS asks for another width and its kernel fits the device.
+// Every condition here answers "is a kernel compiled for this": the caller opted in.
 static bool ggml_cuda_fattn_native_supported(
-        const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
+        const int device, const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
         int * ncols1, int * ncols2) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -757,14 +758,26 @@ static bool ggml_cuda_fattn_native_supported(
 
     const bool wide_tile    = ampere_mma_available(cc);
 
+    // The tile width for a query batch large enough to fill the wide shapes: 64 columns on Ampere and newer,
+    // on a pinned card what GGML_CUDA_FA_TURING_COLS asks for. The 128-column shapes (wide128 below) stay
+    // Ampere-only. has_narrow_cols names whether a kernel for 16 columns exists at that ncols2.
+    const auto prompt_cols = [&](const int ncols2, const bool has_narrow_cols) {
+        return wide_tile ? 64 : ggml_cuda_fattn_pick_turing_cols(device, "native", Q->ne[0], Q->ne[0], ncols2,
+            K->type, V->type, has_narrow_cols);
+    };
+
     // Small query batches (decode, speculative decoding) take narrower tiles. They are bound by
     // reading K/V, which this route does once per KV head at 4.5 to 8.5 bits per value.
     if (Q->ne[0] == 512) {
         if (gqa_ratio <= 4) {
             return false;
         }
-        // Turing has no 1x8 and 2x8 kernel at D=512, see flash_attn_ext_f16_iter().
-        *ncols1 = Q->ne[1] > 4 ? (wide_tile ? 8 : 4) : (Q->ne[1] > 2 || !wide_tile ? 4 : Q->ne[1]);
+        if (Q->ne[1] > 4) {
+            *ncols1 = prompt_cols(8, false) / 8;
+        } else {
+            // Turing has no 1x8 and 2x8 kernel at D=512, see flash_attn_ext_f16_iter().
+            *ncols1 = Q->ne[1] > 2 || !wide_tile ? 4 : Q->ne[1];
+        }
         *ncols2 = 8;
         return true;
     }
@@ -790,7 +803,11 @@ static bool ggml_cuda_fattn_native_supported(
     const bool wide128 = wide_tile && Q->ne[0] != 64;
     if (heads8) {
         // One or two query tokens take 8 or 16 columns: with 4 query tokens per tile, the rest would be empty.
-        *ncols1 = n_q > 4 ? (wide_tile ? (wide128 && n_q > 8 ? 16 : 8) : 4) : (n_q > 2 ? 4 : n_q);
+        if (n_q > 4) {
+            *ncols1 = (wide128 && n_q > 8 ? 128 : prompt_cols(8, true)) / 8;
+        } else {
+            *ncols1 = n_q > 2 ? 4 : n_q;
+        }
         *ncols2 = 8;
         return true;
     }
@@ -798,7 +815,11 @@ static bool ggml_cuda_fattn_native_supported(
     if (gqa_ratio < 2) {
         return false;
     }
-    *ncols1 = n_q > 16 ? (wide_tile ? (wide128 && n_q > 32 ? 64 : 32) : 16) : (n_q > 4 ? 16 : 4);
+    if (n_q > 16) {
+        *ncols1 = (wide128 && n_q > 32 ? 128 : prompt_cols(2, false)) / 2; // no 16-column kernel for ncols2=2
+    } else {
+        *ncols1 = n_q > 4 ? 16 : 4;
+    }
     *ncols2 = 2;
     return true;
 }
@@ -813,7 +834,7 @@ static bool ggml_cuda_fattn_native_applies(
         const int device, const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
         int * ncols1, int * ncols2) {
     if (!ggml_cuda_fattn_native_enabled(dst) ||
-            !ggml_cuda_fattn_native_supported(cc, dst, gqa_opt_applies, gqa_ratio, ncols1, ncols2)) {
+            !ggml_cuda_fattn_native_supported(device, cc, dst, gqa_opt_applies, gqa_ratio, ncols1, ncols2)) {
         return false;
     }
     // The staging is planned for the shared memory of the compiled architecture, see ggml_cuda_fattn_quant_smem_per_sm().
