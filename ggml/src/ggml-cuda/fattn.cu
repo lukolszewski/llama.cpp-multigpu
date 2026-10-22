@@ -7,6 +7,7 @@
 #include "fattn.cuh"
 
 #include <atomic>
+#include <mutex>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -154,6 +155,79 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// Turing stops at tiles of 32 query columns where Ampere takes 64 (shared memory and registers). That pin is a
+// tuning choice, not a correctness rule, so GGML_CUDA_FA_TURING_COLS moves it to 16 or 64 columns to compare tile
+// widths on a Turing build. Unset or 32 keeps today's routing exactly.
+static int ggml_cuda_fattn_turing_cols(void) {
+    static const int cols = []() {
+        const char * env = getenv("GGML_CUDA_FA_TURING_COLS");
+        int cols = 32;
+        if (env != nullptr) {
+            const int value = atoi(env);
+            if (value == 16 || value == 32 || value == 64) {
+                cols = value;
+            } else {
+                GGML_LOG_WARN("%s: ignoring GGML_CUDA_FA_TURING_COLS='%s', expected 16, 32, or 64\n", __func__, env);
+            }
+        }
+        return cols;
+    }();
+    return cols;
+}
+
+static bool ggml_cuda_fattn_turing_pinned(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING;
+}
+
+// Width in columns a pinned card should use for its widest tile: what GGML_CUDA_FA_TURING_COLS asks for, if a kernel
+// for that width is compiled (has_narrow_cols says whether the 16-column one is) and if its shared memory fits the
+// device. Else the pinned 32 columns. Logged once per shape and request, since the point of the knob is to see what
+// it selected and what that costs.
+static int ggml_cuda_fattn_pick_turing_cols(const int device, const char * path, const int DKQ, const int DV,
+        const int ncols2, const ggml_type type_K, const ggml_type type_V, const bool has_narrow_cols) {
+    const int requested = ggml_cuda_fattn_turing_cols();
+    if (requested == 32) {
+        return 32;
+    }
+
+    static std::mutex mutex;
+    static uint64_t logged[64];
+    static int n_logged = 0;
+
+    const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[device];
+    const auto shared_bytes = [&](const int cols) {
+        return ggml_cuda_flash_attn_ext_mma_f16_nbytes_shared(DKQ, DV, cols/ncols2, ncols2, type_K, type_V, info.cc, info.warp_size);
+    };
+
+    int    cols   = 32;
+    size_t nbytes = shared_bytes(32);
+    if (requested == 64 || has_narrow_cols) {
+        const size_t nbytes_requested = shared_bytes(requested);
+        if (nbytes_requested <= info.smpbo) {
+            cols   = requested;
+            nbytes = nbytes_requested;
+        }
+    }
+
+    const uint64_t key = (uint64_t(uintptr_t(path) & 0xfff) << 40) | (uint64_t(DKQ) << 24) | (uint64_t(ncols2) << 16) |
+        (uint64_t(requested) << 8) | uint64_t(cols);
+
+    std::lock_guard<std::mutex> lock(mutex);
+    for (int i = 0; i < n_logged; ++i) {
+        if (logged[i] == key) {
+            return cols;
+        }
+    }
+    if (n_logged < (int) (sizeof(logged) / sizeof(logged[0]))) {
+        logged[n_logged++] = key;
+    }
+
+    GGML_LOG_INFO("%s: GGML_CUDA_FA_TURING_COLS=%d: %s kernel at D=%d with ncols2=%d takes a %dx%d tile (%d columns), "
+        "%zu KiB shared memory of %zu KiB available%s\n", __func__, requested, path, DKQ, ncols2, cols/ncols2, ncols2, cols,
+        nbytes / 1024, info.smpbo / 1024, cols == requested ? "" : ", keeping the pinned width");
+    return cols;
+}
+
 // Counts the FlashAttention nodes that took the quantized-native route. Route
 // selection is otherwise only observable through allocation size or throughput,
 // which are incidental; test-backend-ops reads this to assert which path a case
@@ -194,8 +268,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
-    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
-            (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
+    // RDNA with a large head and every Turing build stop at 32 columns, Ampere and newer take 64.
+    // GGML_CUDA_FA_TURING_COLS moves the Turing pin; a 16-column kernel is compiled only for ncols2 <= 16.
+    int cols = (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256) ? 32 : 64;
+    if (ggml_cuda_fattn_turing_pinned(cc)) {
+        cols = ggml_cuda_fattn_pick_turing_cols(ctx.device, "f16", DKQ, DV, ncols2, GGML_TYPE_F16, GGML_TYPE_F16,
+            ncols2 <= 16);
+    }
+
+    if constexpr (ncols2 <= 16) {
+        if (cols == 16) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
+    if (Q->ne[1] <= 32/ncols2 || cols == 32) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
