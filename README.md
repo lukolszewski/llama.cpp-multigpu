@@ -43,7 +43,8 @@ compared against upstream, generalized, upstreamed, or deleted on its own. See
 | --- | --- | --- |
 | Primary | **Qwen3.8-Flash-Next** (llama.cpp arch `qwen4exp`) | the model the patches were written and measured against; the benchmark configuration is `unsloth/Qwen3.8-Flash-Next-GGUF`, `UD-Q4_K_XL` |
 | Experimental | none yet | would need to be demonstrated before being listed |
-| Might benefit, not demonstrated | Qwen3.8-27B, Qwen3.6-MoE, other architecturally related hybrid/sparse-attention MoE models | no claims made; treat as untested |
+| Demonstrated on Turing | **Qwen3.8-27B** (`Qwen3.8-27B-UD-IQ4_XS`) on 2 × RTX 2080 Ti 22 GB, tensor split, `q8_0` KV, 262k context | single-user decode 1.2–1.75× and prefill 1.07–1.12× vs upstream from 58k context on, flat with depth where upstream decays; opt-in via `LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS=1 GGML_CUDA_FA_TURING_COLS=64` — see [§4](#4-performance-summary) |
+| Might benefit, not demonstrated | Qwen3.6-MoE, other architecturally related hybrid/sparse-attention MoE models | no claims made; treat as untested |
 
 Qwen3.6, Qwen3.8 and Qwen3.8-Next are distinct model families. Sharing implementation details is not
 the same as sharing support, so **no generic "Qwen support" is claimed here**. Multi-GPU work on other
@@ -127,6 +128,28 @@ exactly where the workload lives — long contexts, several sessions — and sma
 
 Mixed prefill + generation is deliberately absent from the headline table and is documented separately
 in [docs/multigpu/benchmarks.md#mixed-workload-behavior](docs/multigpu/benchmarks.md#mixed-workload-behavior).
+
+### Qwen3.8-27B on 2 × RTX 2080 Ti 22 GB (Turing, sm_75)
+
+Measured 2026-10-22 on `kamserw2` (CUDA 12.4, driver 550): model `Qwen3.8-27B-UD-IQ4_XS`, `--split-mode tensor -ts 1,1`,
+`q8_0` KV cache, `-c 262144`, MTP draft `--spec-draft-n-max 2`, `-b 256 -ub 256`, one user. Upstream is `b11060` with the
+same arguments; the patched side is this branch with `LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS=1 GGML_CUDA_FA_TURING_COLS=64`.
+Decode and prefill in tokens/s at the stated context depth.
+
+| Context | Decode upstream → patched | Prefill upstream → patched |
+| --- | --- | --- |
+| 2.9k | 76.1 → 72.7 (noise) | 1068 → 1100 |
+| 58k | 53.4 → 63.0 (×1.18) | 825 → 886 (×1.07) |
+| 116k | 41.4 → 64.2 (×1.55) | 656 → 720 (×1.10) |
+| 145k | 38.0 → 61.1 (×1.61) | 603 → 666 (×1.10) |
+| 203k | 34.6 → 56.4 (×1.63) | 504 → 562 (×1.12) |
+| 247k | 26.8 → 46.8 (×1.75) | 451 → 507 (×1.12) |
+
+Cause: on sm_75 a `q8_0` KV cache was converted to f16 for every FlashAttention call with ≥ 2 query tokens, and the
+1-token path lost its GQA reuse, so decode decayed with depth far faster than with an f16 KV cache. The native-quant
+kernels read `q8_0` in place and the 64-column tile doubles the K/V reuse per shared-memory load during prefill. Both
+are opt-in through the two environment variables; unset, the build behaves as upstream (patches 48–52 in
+[docs/multigpu/patches.md](docs/multigpu/patches.md)).
 
 ## 5. Hardware tested
 

@@ -61,6 +61,11 @@ with the groups.
 | 45 | `83f09b865` | 2026-10-05 | server | speculative: fresh n-gram map per new prompt; server: cap on the number of drafting users | `LLAMA_SERVER_SPEC_MAX_USERS` | — |
 | 46 | `7c29e21b8` | 2026-10-05 | server | server: acceptance gate for speculative drafts | `LLAMA_SERVER_SPEC_MIN_ACCEPT` | — |
 | 47 | `e4054f726` | 2026-10-05 | llama | llama: portable std::max in output_reserve (gcc 13 rejects the explicit-template brace-list form) | — | — |
+| 48 | `286d6953b` | 2026-10-22 | CUDA FA | sync of the FlashAttention/MMA files (`fattn*.cu/.cuh`, `mma.cuh`, `cp-async.cuh`) to upstream `a37cc4610`: swizzle refactor, whole-tile scheduling, process_tile race fix, config tuning; prerequisite for 49–52. Upstream already carries the fork's sparse D=256 1×8 case | built in | upstream [#28536](https://github.com/ggml-org/llama.cpp/pull/28536), [#29612](https://github.com/ggml-org/llama.cpp/pull/29612), [#29435](https://github.com/ggml-org/llama.cpp/pull/29435), [#30103](https://github.com/ggml-org/llama.cpp/pull/30103) |
+| 49 | `c7d4c6d44`…`607f75c68` | 2026-10-22 | CUDA FA | PR #85 native quantized FA (21 commits, cherry-picked with `-x`): the MMA FlashAttention kernels read a `q8_0`/`q4_0` (and `q4_1`/`q5_0`/`q5_1` via `GGML_CUDA_FA_QUANTS`) K/V cache in place instead of casting it to f16 per call; tiles for decode, speculative batches and 128-column prompt tiles; stream-k; `NATIVE_QUANT_EQUIVALENCE` test, kernel-inventory CI script | `LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS=1` / `--flash-attn-native-quants` (off) | fork PR #85 (piggidragon, `fattn-native-quants-flag`), on upstream `a37cc4610`; not an upstream PR |
+| 50 | `aa294aa24`, `bafe67a7e`, `f4161cbb3` | 2026-10-22 | CUDA FA | PR #30792 q8_0 tile route: native `q8_0` KV (and f16 K / `q8_0` V) in the flash-attn tile kernel, `(f16, q8_0)` test coverage, Turing routing of `q8_0` decode to the tile kernel; off by default, measured slower than 49 on the 2080 Ti, kept for A/B | `GGML_CUDA_FA_Q8_TILE=N` (unset = off) | upstream [#30792](https://github.com/ggml-org/llama.cpp/pull/30792) |
+| 51 | `9838c1aa2`, `5de885b4a` | 2026-10-22 | tests / docs | Turing audit of PR #85 for sm_75 (`AUDIT-D5.md`) and `test-backend-ops` cases for the Qwen3.8-27B per-device shape (D=256, 2 KV heads, GQA 6, `q8_0`, nb 1/2/3/256) | — | — |
+| 52 | `8ad6d7f11`, `b72668413`, `7cbcafe48`, `c44b327b0`, `b75cf989f`, `47daf3b50` | 2026-10-22 | CUDA FA | Turing tile-width knob: `ggml_cuda_fattn_pick_turing_cols` in `fattn.cu` pins the f16-MMA and native-route tile width on sm_75, the 64-column trap in `fattn-mma-f16.cuh` is lifted so sm_75 compiles tiles of up to 64 columns; logs the pinned width; report in `docs/pm/D6-turing-tile-knob-RESULT.md` | `GGML_CUDA_FA_TURING_COLS=16\|32\|64` (unset = upstream choice) | — |
 
 ## Runtime switches, with defaults read from the code
 
@@ -103,6 +108,9 @@ assumed.
 | `--spec-type ngram-map-k4v` (+ `--spec-ngram-map-k4v-size-m 48`) | off | n-gram lookup speculation: no draft model; the 48 tokens that followed an earlier occurrence of the last 12 tokens are proposed and verified in one batch; output identical to greedy. Checkpoints are recurrent-state snapshots in the memory (patch 44); `LLAMA_SERVER_SPEC_CKPT_SYNC=1` = old host copies |
 | `LLAMA_SERVER_SPEC_MAX_USERS` | `0` (no cap) | draft only while ≤ N slots generate — every draft round re-plans the shared graph twice (~60 ms felt by every user); production: 2 (patch 46) |
 | `LLAMA_SERVER_SPEC_MIN_ACCEPT` | `2.5` | acceptance gate: keep drafting while the EMA of accepted draft tokens per round ≥ this × generating users (patch 47) |
+| `LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS` / `--flash-attn-native-quants` | off | `1`: quantized-native FlashAttention — the CUDA MMA kernels read a `q8_0`/`q4_0` KV cache in place instead of casting to f16 per call (patch 49); changes rounding order slightly |
+| `GGML_CUDA_FA_Q8_TILE` | unset (off) | `N`: on Turing route `q8_0`-KV FlashAttention with up to N query tokens to the tile kernel (patch 50); A/B knob, slower than patch 49 on the 2080 Ti |
+| `GGML_CUDA_FA_TURING_COLS` | unset (upstream choice) | `16`, `32` or `64`: tile width of the f16-MMA and native FlashAttention kernels on sm_75; `64` doubles K/V reuse per shared-memory load for prefill (patch 52) |
 
 ## Comparing a patch against upstream
 
