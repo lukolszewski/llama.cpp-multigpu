@@ -10647,6 +10647,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 4, 1},  1024,    7, 1);
     add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 1, 1},  1024,   65, 0);
     add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 1, 1},  1024,    1, 0);
+    // 2 KV heads at GQA 6 and long KV, as in Qwen3.8-27B on 2x RTX 2080 Ti: decode, 2 slots, MTP verify,
+    // and a prefill ubatch. The tile shapes here are 1x8, 2x8, 4x8, and 16x2 for a Turing tile cap of 32.
+    for (int64_t nb : { 1, 2, 3, 256 }) {
+        add_native_equivalence(GGML_TYPE_Q8_0, 256, 2, { 6, 1},  4096, nb, 1);
+    }
+    add_native_equivalence(GGML_TYPE_Q8_0, 256, 2, { 6, 1},  8192,    3, 1);
+    add_native_equivalence(GGML_TYPE_Q8_0, 256, 2, { 6, 1}, 16384,    1, 1);
     // D=128 has the D=256 rows; its rows of 2 mod 4 byte blocks are staged in 8-byte pieces
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
         add_native_equivalence(type, 128, 4, { 8, 1},  1024,   65, 1);
@@ -10801,6 +10808,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
+
+    // dense q8_0 cache at the Qwen3.8-27B geometry (D=256, 12 Q heads of 2 KV heads, gqa 6) with
+    // decode-sized query batches and no sparse KV set, the shape --flash-attn-native-quants targets
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 6, 1},  4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, 1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 6, 1},  8192, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, 1));
 
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
