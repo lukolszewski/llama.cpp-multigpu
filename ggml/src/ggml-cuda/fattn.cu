@@ -199,8 +199,9 @@ static int ggml_cuda_fattn_pick_turing_cols(const int device, const char * path,
         return ggml_cuda_flash_attn_ext_mma_f16_nbytes_shared(DKQ, DV, cols/ncols2, ncols2, type_K, type_V, info.cc, info.warp_size);
     };
 
-    int    cols   = 32;
-    size_t nbytes = shared_bytes(32);
+    const size_t nbytes_pinned = shared_bytes(32);
+    int          cols          = 32;
+    size_t       nbytes        = nbytes_pinned;
     if (requested == 64 || has_narrow_cols) {
         const size_t nbytes_requested = shared_bytes(requested);
         if (nbytes_requested <= info.smpbo) {
@@ -209,7 +210,7 @@ static int ggml_cuda_fattn_pick_turing_cols(const int device, const char * path,
         }
     }
 
-    const uint64_t key = (uint64_t(uintptr_t(path) & 0xfff) << 40) | (uint64_t(DKQ) << 24) | (uint64_t(ncols2) << 16) |
+    const uint64_t key = (uint64_t(path[0]) << 40) | (uint64_t(DKQ) << 24) | (uint64_t(ncols2) << 16) |
         (uint64_t(requested) << 8) | uint64_t(cols);
 
     std::lock_guard<std::mutex> lock(mutex);
@@ -223,8 +224,9 @@ static int ggml_cuda_fattn_pick_turing_cols(const int device, const char * path,
     }
 
     GGML_LOG_INFO("%s: GGML_CUDA_FA_TURING_COLS=%d: %s kernel at D=%d with ncols2=%d takes a %dx%d tile (%d columns), "
-        "%zu KiB shared memory of %zu KiB available%s\n", __func__, requested, path, DKQ, ncols2, cols/ncols2, ncols2, cols,
-        nbytes / 1024, info.smpbo / 1024, cols == requested ? "" : ", keeping the pinned width");
+        "%zu KiB shared memory of %zu KiB available, the pinned %dx%d tile needs %zu KiB%s\n", __func__, requested, path,
+        DKQ, ncols2, cols/ncols2, ncols2, cols, nbytes / 1024, info.smpbo / 1024, 32/ncols2, ncols2, nbytes_pinned / 1024,
+        cols == requested ? "" : ", keeping the pinned width");
     return cols;
 }
 
@@ -772,10 +774,10 @@ static bool ggml_cuda_fattn_native_supported(
         if (gqa_ratio <= 4) {
             return false;
         }
+        // Turing has no 1x8 and 2x8 kernel at D=512, see flash_attn_ext_f16_iter(), so no 16-column tile either.
         if (Q->ne[1] > 4) {
             *ncols1 = prompt_cols(8, false) / 8;
         } else {
-            // Turing has no 1x8 and 2x8 kernel at D=512, see flash_attn_ext_f16_iter().
             *ncols1 = Q->ne[1] > 2 || !wide_tile ? 4 : Q->ne[1];
         }
         *ncols2 = 8;
