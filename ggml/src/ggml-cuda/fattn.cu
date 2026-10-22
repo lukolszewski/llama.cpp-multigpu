@@ -613,6 +613,16 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     vec_case(ctx, dst);
 }
 
+// GGML_CUDA_FA_Q8_TILE=N: also use the tile kernel for q8_0 K/V with up to N query tokens on Turing-class GPUs,
+// it reads the cache natively instead of converting K and V to f16 first. Unset or 0 keeps the default routing.
+static int ggml_cuda_fattn_q8_tile_max_q() {
+    static const int max_q = []() {
+        const char * env = getenv("GGML_CUDA_FA_Q8_TILE");
+        return env == nullptr ? 0 : std::max(0, std::atoi(env));
+    }();
+    return max_q;
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
@@ -845,6 +855,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // Lever B knob (GGML_CUDA_FA_Q8_TILE=N): explicit env override, checked first so that TILE vs native
+        // can be compared in one build. Unset = no effect.
+        const int q8_tile_max_q = ggml_cuda_fattn_q8_tile_max_q();
+        if (q8_tile_max_q > 0 && gqa_opt_applies && ggml_cuda_fattn_kv_native_q8_0(K, V) && Q->ne[1] <= q8_tile_max_q) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
         // Checked before the vector kernel, which reads K/V once per Q head rather than once per KV head.
         int native_ncols1 = 0;
         int native_ncols2 = 0;
