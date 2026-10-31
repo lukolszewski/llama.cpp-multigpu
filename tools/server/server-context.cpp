@@ -3505,7 +3505,13 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
+// timers are always compiled (two ggml_time_us per scope); the report and the post-decode synchronize are enabled
+// at runtime with LLAMA_SERVER_TIMINGS=1
+#define DEBUG_TIMINGS
+    static bool debug_timings_enabled() {
+        static const bool v = getenv("LLAMA_SERVER_TIMINGS") != nullptr && atoi(getenv("LLAMA_SERVER_TIMINGS")) != 0;
+        return v;
+    }
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
         int64_t & t;
@@ -3792,13 +3798,16 @@ private:
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+        if (debug_timings_enabled() && t_start - t_prev > 5 * 1000 * 1000 && n_decode > 0 && n_sampl > 0) { // every 5 seconds
             t_prev = t_start;
             SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
             SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
             SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
             SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+            SRV_INF("n_decode = %" PRId64 " n_sampl = %" PRId64 " (sampl per decode = %.2f)\n", n_decode, n_sampl, (double) n_sampl / n_decode);
+            t_pre_decode = t_decode = t_post_decode = t_sampl = 0;
+            n_pre_decode = n_decode = n_post_decode = n_sampl = 0;
         }
 #endif
 
@@ -3889,7 +3898,9 @@ private:
                 batch.render(off, n_tokens);
                 bool ok = decode(n_batch, off);
 #ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
+                if (debug_timings_enabled()) {
+                    llama_synchronize(ctx_tgt);
+                }
 #endif
 
                 if (ok) {
