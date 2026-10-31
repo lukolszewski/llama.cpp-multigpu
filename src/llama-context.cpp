@@ -4521,6 +4521,10 @@ bool llama_output_slots_set(llama_context * ctx, int32_t n) {
     return ctx->output_slots_set(n);
 }
 
+void llama_output_synchronize(llama_context * ctx) {
+    ctx->output_synchronize();
+}
+
 int32_t llama_output_slot(const llama_context * ctx) {
     return ctx->output_slot_last();
 }
