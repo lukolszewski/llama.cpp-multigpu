@@ -2488,7 +2488,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     // the per-slot regions (rows_per_slot in decode()) derive from logits.size: keep the capacity monotonic so that
     // batches of different sizes parked in different output slots never overlap
-    const int64_t n_outputs_max = std::max<int64_t>({(int64_t) n_outputs, (int64_t) n_seq_max(), (int64_t) n_outputs_cap});
+    const int64_t n_outputs_max = std::max(std::max((int64_t) n_outputs, (int64_t) n_seq_max()), (int64_t) n_outputs_cap);
     n_outputs_cap = (uint32_t) n_outputs_max;
 
     const auto n_batch    = cparams.n_batch;
