@@ -2170,7 +2170,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         for (int k = 0; k < n_out_slots && out_slots[cur].pending; ++k) {
             cur = (cur + 1) % n_out_slots;
         }
-        GGML_ASSERT(!out_slots[cur].pending && "all output slots hold unconsumed results - read them before issuing more decodes");
+        if (out_slots[cur].pending) {
+            // every slot holds a result nobody has read: the caller leaked one (results must be consumed or released
+            // with llama_output_synchronize). Reclaim the oldest instead of aborting the server - its result is lost.
+            cur = (out_slot_last + 1) % n_out_slots;
+            LLAMA_LOG_WARN("%s: all %d output slots hold unconsumed results - reclaiming slot %d (a result was never read)\n", __func__, n_out_slots, cur);
+            auto & s = out_slots[cur];
+            if (s.ev) {
+                ggml_backend_event_synchronize(s.ev);
+            } else {
+                synchronize();
+            }
+            s.pending = false;
+        }
         const int64_t rows_per_slot = logits.size / ((int64_t) n_vocab * n_out_slots);
         GGML_ASSERT(n_outputs_all <= rows_per_slot);
         out_slot_last = out_slot_sel = cur;

@@ -4309,6 +4309,10 @@ private:
                         SRV_ERR("post_decode() failed: %s\n", e.what());
                         abort_all_slots("post_decode() failed: " + std::string(e.what()));
                     }
+                    // release the output slot even if nobody read its logits: a request cancelled between the decode
+                    // and this visit leaves its result unread, and the slot would stay "pending" until the next
+                    // all-idle synchronize - under sustained load that is never, and the ring fills up (5 cancels)
+                    llama_output_synchronize(ctx_tgt);
                     pb.active = false;
                 }
             }
