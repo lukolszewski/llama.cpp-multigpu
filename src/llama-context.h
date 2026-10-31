@@ -457,9 +457,15 @@ private:
 
     // pipeline parallelism: last graph shape class the compute buffers were reserved for
     bool     reserve_on_demand_disable = false;
-    uint32_t reserve_key_tokens = 0;
-    uint32_t reserve_key_seqs   = 0;
-    uint32_t reserve_key_outputs = 0;
+    // every shape class (n_tokens, n_seqs, n_outputs) the compute buffers were reserved for: the scheduler's buffers
+    // never shrink, so a class stays covered once reserved, and alternating classes (prefill ubatches between
+    // decode ubatches) must not re-reserve - each re-reserve drains the pipeline and builds a full-context graph
+    struct reserve_key_t {
+        uint32_t n_tokens;
+        uint32_t n_seqs;
+        uint32_t n_outputs;
+    };
+    std::vector<reserve_key_t> reserve_keys;
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -1674,7 +1674,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             // 0 and 1 outputs build the same graph (an empty out_ids gather); graph_reserve needs at least 1
             const uint32_t key_outputs = std::max<uint32_t>(1, std::min<uint32_t>(this->n_outputs, cparams.n_outputs_max));
 
-            if (key_tokens != reserve_key_tokens || key_seqs != reserve_key_seqs || key_outputs != reserve_key_outputs) {
+            // covered if a reserved class with the same number of streams is at least as large in tokens and outputs
+            // (the compute buffer requirements are monotone in both for a fixed n_seqs)
+            bool covered = false;
+            for (const auto & k : reserve_keys) {
+                if (k.n_seqs == key_seqs && k.n_tokens >= key_tokens && k.n_outputs >= key_outputs) {
+                    covered = true;
+                    break;
+                }
+            }
+
+            if (!covered) {
                 // the sparse attention needs the memory context to span exactly the ubatch's streams
                 auto * mem_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
                 const auto mctx_full = mem_idx ? mem_idx->init_full_ns(key_seqs) : memory->init_full();
@@ -1691,9 +1701,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         LLAMA_LOG_WARN("%s: re-reserve for n_tokens = %u, n_seqs = %u failed, continuing\n", __func__, key_tokens, key_seqs);
                     }
                 }
-                reserve_key_tokens  = key_tokens;
-                reserve_key_seqs    = key_seqs;
-                reserve_key_outputs = key_outputs;
+                reserve_keys.push_back({ key_tokens, key_seqs, key_outputs });
             }
         }
 
