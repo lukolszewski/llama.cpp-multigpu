@@ -1189,6 +1189,19 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->rs_idx != nullptr || inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
+    if (!res && getenv("LLAMA_UBATCH_TRACE")) {
+        LLAMA_LOG_WARN("ubatch-trace: mem_hybrid reject detail: k_idxs %d/%d kq_mask %d kq_dev %d/%d n_rs %d/%d main %d/%d extra %d/%d rs_idx %d pipelined %d head %d/%d rs_z %d/%d\n",
+                (int) inp_attn->self_k_idxs->ne[0], (int) params.ubatch.n_tokens,
+                (int) can_reuse_kq_mask(inp_attn->self_kq_mask_cnv, mctx->get_attn(), params.ubatch, params.cparams),
+                (int) (inp_attn->self_kq_pos != nullptr), (int) kq_mask_on_device(inp_attn->hparams, params.cparams, params.ubatch),
+                (int) inp_rs->s_copy->ne[0], (int) mctx->get_recr()->get_n_rs(),
+                (int) inp_rs->s_copy_main->ne[0], (int) params.ubatch.n_seqs,
+                (int) inp_rs->s_copy_extra->ne[0], (int) (mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs),
+                (int) (inp_rs->rs_idx != nullptr), (int) mctx->get_recr()->decode_pipelined(),
+                (int) inp_rs->head, (int) mctx->get_recr()->get_head(),
+                (int) inp_rs->rs_z, (int) mctx->get_recr()->get_rs_z());
+    }
+
     return res;
 }
 
