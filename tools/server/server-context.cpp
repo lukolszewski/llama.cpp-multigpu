@@ -1431,6 +1431,7 @@ private:
     common_speculative_ptr spec;
 
     bool spec_ckpt_snap   = true;  // speculative checkpoints as recurrent-state snapshots (LLAMA_SERVER_SPEC_CKPT_SYNC=1: host copies)
+    int  spec_max_users   = 0;     // draft only while at most this many slots generate (0 = always); LLAMA_SERVER_SPEC_MAX_USERS
     bool spec_snap_logged = false;
 
     bool add_bos_token = true;
@@ -1888,6 +1889,13 @@ private:
             }
             if (spec) {
                 spec_ckpt_snap = getenv("LLAMA_SERVER_SPEC_CKPT_SYNC") == nullptr;
+                // every draft round changes the batch shape, and with decode groups the shared graph is re-planned
+                // for it and again for the next 1-token batch (~60 ms of pipeline time per round): one speculating
+                // user slows the co-tenants (5u@58k: 38 -> 34 t/s for the others) - cap the users that may draft
+                if (const char * e = getenv("LLAMA_SERVER_SPEC_MAX_USERS")) {
+                    spec_max_users = std::max(0, atoi(e));
+                }
+                SRV_INF("speculative drafts: %s\n", spec_max_users > 0 ? string_format("while at most %d slots generate (LLAMA_SERVER_SPEC_MAX_USERS)", spec_max_users).c_str() : "always");
                 if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                     SRV_INF("speculative checkpoints: %s\n", spec_ckpt_snap ? "recurrent-state snapshots when the memory has spare cells" : "synchronous host copies (LLAMA_SERVER_SPEC_CKPT_SYNC)");
                 }
@@ -4676,6 +4684,14 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // generating slots over all groups (the speculation cap counts everybody, not just this group)
+        int n_gen_all = 0;
+        if (spec && spec_max_users > 0) {
+            iterate(slots, [&](server_slot & slot) {
+                n_gen_all += slot.state == SLOT_STATE_GENERATING ? 1 : 0;
+            });
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -4704,7 +4720,10 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                // over the cap: no NEW drafts (a pending replay of accepted tokens still goes through)
+                const bool spec_capped = spec_max_users > 0 && n_gen_all > spec_max_users && slot.spec_draft.empty();
+
+                const int n_draft_max = spec_capped ? 0 : slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());

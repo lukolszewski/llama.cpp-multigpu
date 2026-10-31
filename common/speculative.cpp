@@ -1980,11 +1980,19 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     // n_seq configs
     std::vector<common_ngram_map> config;
 
+    // the empty map every sequence starts from, and the prompt each sequence's map was built on: the map indexes
+    // into the caller's token vector, so it is only valid for a continuation of that prompt (a chat turn appended);
+    // a different prompt in the same sequence (a server slot serving another request) gets a fresh map
+    const common_ngram_map config0;
+    std::vector<llama_tokens> prompt_prev;
+
     common_speculative_impl_ngram_map_k(
             const common_ngram_map & config,
             uint32_t n_seq)
         : common_speculative_impl(config.key_only ? COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K
             : COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, n_seq, config.size_value)
+        , config0(config)
+        , prompt_prev(n_seq)
     {
         for (uint32_t i = 0; i < n_seq; i++) {
             this->config.push_back(config);
@@ -1998,7 +2006,21 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
 
+        auto & prev = prompt_prev[seq_id];
+
+        const bool continuation = !prev.empty() && prompt.size() >= prev.size() &&
+            std::equal(prev.begin(), prev.end(), prompt.begin());
+
+        if (!continuation && !prev.empty()) {
+            // not an extension of the previous prompt: the stored key / value indices point into other text, and the
+            // hash map would also disable the linear search over the kept range -> no (or wrong) drafts
+            SPC_TRC("seq %d: new prompt (%zu tokens, previous %zu) - resetting the n-gram map\n", seq_id, prompt.size(), prev.size());
+            config[seq_id] = config0;
+        }
+
         common_ngram_map_begin(config[seq_id], prompt);
+
+        prev = prompt;
     }
 
     bool process(const common_batch & /*batch*/) override {
