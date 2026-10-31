@@ -1330,7 +1330,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
 uint32_t llama_kv_cache::get_n_kv_all() const {
     uint32_t result = 0;
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    const uint32_t n_pad_cur = 256u;
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
         if (cells.get_used() == 0) {
