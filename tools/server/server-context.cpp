@@ -3972,7 +3972,7 @@ private:
                 }
                 decode_defer_sync = false;
 #ifdef DEBUG_TIMINGS
-                if (debug_timings_enabled()) {
+                if (debug_timings_enabled() && n_groups == 1) {
                     llama_synchronize(ctx_tgt);
                 }
 #endif

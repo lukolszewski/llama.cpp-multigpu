@@ -939,6 +939,11 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    static const bool trace = getenv("LLAMA_UBATCH_TRACE") != nullptr;
+    if (trace && n_out_slots > 1) {
+        LLAMA_LOG_WARN("ubatch-trace: FULL synchronize (out slots in use)\n");
+    }
+
     for (auto & s : out_slots) {
         s.pending = false;
     }
