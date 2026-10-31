@@ -1666,6 +1666,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
+        // staged asynchronous scheduler inputs are only needed when consecutive ubatches of a reused graph overlap,
+        // i.e. the per-sequence pipelined decode; solo decode and prefill keep the plain synchronous copies
+        ggml_backend_sched_set_stage_inputs(sched.get(), cparams.pipeline_parallel && mctx && mctx->decode_pipelined());
+
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
