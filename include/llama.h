@@ -1133,6 +1133,17 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
+    // Multiple in-flight batches: give the context `n` independent output regions (logits/embeddings) so that several
+    // llama_decode() calls can be issued without waiting for the previous one's results. Each decode writes to a free
+    // region and records a completion event; llama_get_logits*() / llama_get_embeddings*() then wait only for the
+    // region currently selected (by default the one of the most recent decode). The caller must consume (read) a
+    // decode's results before `n` further decodes are issued. n = 1 (default) is the classic behaviour.
+    LLAMA_API bool    llama_output_slots_set(struct llama_context * ctx, int32_t n);
+    // output slot used by the most recent llama_decode()
+    LLAMA_API int32_t llama_output_slot(const struct llama_context * ctx);
+    // make the ith accessors refer to the given output slot (a slot returned by llama_output_slot after that decode)
+    LLAMA_API void    llama_output_select(struct llama_context * ctx, int32_t slot);
+
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.

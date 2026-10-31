@@ -60,6 +60,13 @@ struct llama_context {
 
     void synchronize();
 
+    // multiple in-flight batches (see llama_output_slots_set)
+    bool    output_slots_set(int32_t n);
+    int32_t output_slot_last() const { return out_slot_last; }
+    void    output_select(int32_t slot);
+    // wait only for the selected output slot's results (full synchronize when slots are not in use)
+    void    output_synchronize();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -365,6 +372,21 @@ private:
     };
 
     std::vector<swap_info> output_swaps;
+
+    struct out_slot_t {
+        int64_t  row_base  = 0;
+        uint32_t n_outputs = 0;
+        std::vector<int32_t>   output_ids;
+        std::vector<swap_info> output_swaps;
+        ggml_backend_event_t ev = nullptr;
+        ggml_backend_t       ev_backend = nullptr;
+        bool pending = false; // results not yet waited for by the host
+    };
+    int32_t n_out_slots   = 1;
+    int32_t out_slot_last = 0;
+    int32_t out_slot_sel  = 0;
+    int64_t out_row_base  = 0; // first row of the selected slot's region in logits/embd
+    std::vector<out_slot_t> out_slots;
 
     ggml_backend_sched_ptr sched;
 

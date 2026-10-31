@@ -608,6 +608,13 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    for (auto & s : out_slots) {
+        if (s.ev) {
+            ggml_backend_event_free(s.ev);
+            s.ev = nullptr;
+        }
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -932,6 +939,10 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    for (auto & s : out_slots) {
+        s.pending = false;
+    }
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -1070,7 +1081,57 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
-    return logits.data;
+    return logits.data ? logits.data + out_row_base*model.vocab.n_tokens() : nullptr;
+}
+
+bool llama_context::output_slots_set(int32_t n) {
+    if (n < 1 || n > 16) {
+        return false;
+    }
+    if (!sampling.samplers.empty() || cparams.embeddings_nextn) {
+        LLAMA_LOG_ERROR("%s: output slots are not supported together with backend samplers or nextn embeddings\n", __func__);
+        return false;
+    }
+    synchronize();
+    n_out_slots = n;
+    out_slots.assign(n, {});
+    out_slot_last = out_slot_sel = 0;
+    out_row_base  = 0;
+    // re-create the output buffer with n regions
+    const int32_t n_cur = std::max<int32_t>(1, (int32_t) n_outputs);
+    buf_output = nullptr;
+    logits.data = nullptr;
+    embd.data   = nullptr;
+    return output_reserve(n_cur) >= (uint32_t) n_cur;
+}
+
+void llama_context::output_select(int32_t slot) {
+    if (n_out_slots <= 1 || slot < 0 || slot >= n_out_slots) {
+        return;
+    }
+    auto & s = out_slots[slot];
+    out_slot_sel = slot;
+    out_row_base = s.row_base;
+    n_outputs    = s.n_outputs;
+    output_ids   = s.output_ids;
+    output_swaps = s.output_swaps;
+    s.output_swaps.clear();
+}
+
+void llama_context::output_synchronize() {
+    if (n_out_slots <= 1) {
+        synchronize();
+        return;
+    }
+    auto & s = out_slots[out_slot_sel];
+    if (s.pending) {
+        if (s.ev) {
+            ggml_backend_event_synchronize(s.ev);
+        } else {
+            synchronize();
+        }
+        s.pending = false;
+    }
 }
 
 int64_t llama_context::output_resolve_row(int32_t i) const {
@@ -1111,7 +1172,7 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        return logits.data + j*model.vocab.n_tokens();
+        return logits.data + (out_row_base + j)*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -1125,7 +1186,7 @@ float * llama_context::get_logits_ith(int32_t i) {
 float * llama_context::get_embeddings() {
     output_reorder();
 
-    return embd.data;
+    return embd.data ? embd.data + out_row_base*model.hparams.n_embd_out() : nullptr;
 }
 
 llama_token * llama_context::get_sampled_tokens()  const{
@@ -1142,7 +1203,7 @@ float * llama_context::get_embeddings_ith(int32_t i) {
 
         const int64_t j = output_resolve_row(i);
         const uint32_t n_embd_out = model.hparams.n_embd_out();
-        return embd.data + j*n_embd_out;
+        return embd.data + (out_row_base + j)*n_embd_out;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -2087,6 +2148,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -2;
     };
 
+    // pick the output region for this batch (multiple in-flight batches, see llama_output_slots_set)
+    ggml_backend_t out_backend = nullptr;
+    if (n_out_slots > 1) {
+        int32_t cur = (out_slot_last + 1) % n_out_slots;
+        for (int k = 0; k < n_out_slots && out_slots[cur].pending; ++k) {
+            cur = (cur + 1) % n_out_slots;
+        }
+        GGML_ASSERT(!out_slots[cur].pending && "all output slots hold unconsumed results - read them before issuing more decodes");
+        const int64_t rows_per_slot = logits.size / ((int64_t) n_vocab * n_out_slots);
+        GGML_ASSERT(n_outputs_all <= rows_per_slot);
+        out_slot_last = out_slot_sel = cur;
+        out_row_base  = (int64_t) cur * rows_per_slot;
+        output_swaps.clear();
+    } else {
+        out_row_base = 0;
+    }
+
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
@@ -2168,12 +2246,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            float * logits_out = logits.data + (out_row_base + n_outputs_prev)*n_vocab;
 
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                GGML_ASSERT((out_row_base + n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                out_backend = backend_res;
             }
         }
 
@@ -2188,7 +2267,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         // extract token embeddings
                         GGML_ASSERT(embd.data != nullptr);
                         const uint32_t n_embd_out = hparams.n_embd_out();
-                        float * embd_out = embd.data + n_outputs_prev*n_embd_out;
+                        float * embd_out = embd.data + (out_row_base + n_outputs_prev)*n_embd_out;
 
                         if (n_outputs) {
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
@@ -2331,6 +2410,30 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    // multiple in-flight batches: remember this batch's output mapping and record its completion event
+    if (n_out_slots > 1) {
+        auto & s = out_slots[out_slot_sel];
+        s.row_base     = out_row_base;
+        s.n_outputs    = n_outputs;
+        s.output_ids   = output_ids;
+        s.output_swaps = output_swaps;
+        s.pending      = false;
+        if (out_backend) {
+            if (s.ev && s.ev_backend != out_backend) {
+                ggml_backend_event_free(s.ev);
+                s.ev = nullptr;
+            }
+            if (!s.ev) {
+                s.ev = ggml_backend_event_new(ggml_backend_get_device(out_backend));
+                s.ev_backend = out_backend;
+            }
+            if (s.ev) {
+                ggml_backend_event_record(s.ev, out_backend);
+                s.pending = true;
+            }
+        }
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
@@ -2366,8 +2469,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
-    logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
-    embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
+    logits.size     = has_logits     ? n_vocab*n_outputs_max*n_out_slots    : 0;
+    embd.size       = has_embd       ? n_embd_out*n_outputs_max*n_out_slots : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
@@ -2547,13 +2650,13 @@ void llama_context::output_reorder() {
 
         if (logits.size > 0) {
             for (uint64_t k = 0; k < n_vocab; k++) {
-                std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
+                std::swap(logits.data[(out_row_base + i0)*n_vocab + k], logits.data[(out_row_base + i1)*n_vocab + k]);
             }
         }
 
         if (embd.size > 0) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
-                std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
+                std::swap(embd.data[(out_row_base + i0)*n_embd_out + k], embd.data[(out_row_base + i1)*n_embd_out + k]);
             }
         }
 
@@ -4409,14 +4512,26 @@ void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
 
+bool llama_output_slots_set(llama_context * ctx, int32_t n) {
+    return ctx->output_slots_set(n);
+}
+
+int32_t llama_output_slot(const llama_context * ctx) {
+    return ctx->output_slot_last();
+}
+
+void llama_output_select(llama_context * ctx, int32_t slot) {
+    ctx->output_select(slot);
+}
+
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     float * res = nullptr;
 
@@ -4430,19 +4545,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
 }
