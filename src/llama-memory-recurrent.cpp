@@ -297,6 +297,67 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     }
 }
 
+bool llama_memory_recurrent::seq_snapshot(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || size < 2*n_seq_max) {
+        return false;
+    }
+    if (cells[seq_id].tail < 0) {
+        return false;
+    }
+
+    // the snapshot pseudo sequence joins the tail cell (seq_cp releases a previous snapshot first)
+    seq_cp(seq_id, (llama_seq_id) (n_seq_max + seq_id), -1, -1);
+
+    return true;
+}
+
+bool llama_memory_recurrent::seq_rollback(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || size < 2*n_seq_max) {
+        return false;
+    }
+
+    const llama_seq_id snap = (llama_seq_id) (n_seq_max + seq_id);
+    if (cells[snap].tail < 0) {
+        return false;
+    }
+
+    // drop the sequence's current cell (the rejected speculative state) and re-attach it to the snapshot cell;
+    // the snapshot stays, so the same checkpoint can be restored again
+    seq_cp(snap, seq_id, -1, -1);
+
+    return true;
+}
+
+void llama_memory_recurrent::seq_snapshot_clear(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || size < 2*n_seq_max) {
+        return;
+    }
+
+    const llama_seq_id snap = (llama_seq_id) (n_seq_max + seq_id);
+
+    auto & tail_snap = cells[snap];
+    if (tail_snap.tail < 0) {
+        return;
+    }
+
+    const uint32_t cell_id = tail_snap.tail;
+    auto & cell = cells[cell_id];
+
+    cell.seq_id.erase(snap);
+    tail_snap.tail = -1;
+
+    if (cell.seq_id.empty()) {
+        if (cell.pos >= 0) {
+            used--;
+        }
+        cell.pos = -1;
+        cell.src = -1;
+        if (cell_id < head) {
+            head = cell_id;
+        }
+    }
+}
+
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
 
@@ -693,8 +754,18 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
         }
 
-        rs_z = -1;
+        // the zeroed state is only needed by cells without a source (new sequences); keeping rs_z = -1 otherwise
+        // leaves the graph's zero-view empty and lets a copy-on-write cell (snapshots) reuse the steady-state graph
+        bool need_z = false;
         for (int i = min; i <= max; ++i) {
+            if (cells[i].src < 0) {
+                need_z = true;
+                break;
+            }
+        }
+
+        rs_z = -1;
+        for (int i = min; need_z && i <= max; ++i) {
             if (refcounts[i] == 0) {
                 rs_z = i;
                 break;

@@ -62,6 +62,8 @@ struct llama_context {
 
     // multiple in-flight batches (see llama_output_slots_set)
     bool    output_slots_set(int32_t n);
+    // size the output buffers for n outputs per slot now (public entry for output_reserve())
+    bool    output_reserve_rows(int32_t n_outputs);
     int32_t output_slot_last() const { return out_slot_last; }
     void    output_select(int32_t slot);
     // wait only for the selected output slot's results (full synchronize when slots are not in use)
@@ -392,6 +394,7 @@ private:
     int32_t out_slot_last = 0;
     int32_t out_slot_sel  = 0;
     int64_t out_row_base  = 0; // first row of the selected slot's region in logits/embd
+    uint32_t n_outputs_cap = 0; // rows the output buffers are sized for (monotonic: the slot regions must not move while results are parked)
     std::vector<out_slot_t> out_slots;
 
     ggml_backend_sched_ptr sched;

@@ -155,6 +155,18 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_memory_hybrid::seq_snapshot(llama_seq_id seq_id) {
+    return mem_recr->seq_snapshot(seq_id);
+}
+
+bool llama_memory_hybrid::seq_rollback(llama_seq_id seq_id) {
+    return mem_recr->seq_rollback(seq_id);
+}
+
+void llama_memory_hybrid::seq_snapshot_clear(llama_seq_id seq_id) {
+    mem_recr->seq_snapshot_clear(seq_id);
+}
+
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);

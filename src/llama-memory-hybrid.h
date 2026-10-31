@@ -66,6 +66,11 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    // recurrent-state snapshots (the attention part rolls back with seq_rm)
+    bool seq_snapshot      (llama_seq_id seq_id) override;
+    bool seq_rollback      (llama_seq_id seq_id) override;
+    void seq_snapshot_clear(llama_seq_id seq_id) override;
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 

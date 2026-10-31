@@ -370,6 +370,7 @@ extern "C" {
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_rs_snap;             // spare recurrent-state cells per seq for llama_memory_seq_snapshot() (0 = none) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
@@ -783,6 +784,24 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Recurrent-state snapshots (speculative decoding on recurrent / hybrid models): keep the sequence's current
+    // recurrent state in a spare cell (needs llama_context_params.n_rs_snap >= 1); the next tokens of the sequence
+    // are then written to a fresh cell. llama_memory_seq_rollback() re-attaches the sequence to the snapshot
+    // (the snapshot stays until the next snapshot or clear). The attention part of a hybrid memory is rolled
+    // back separately with llama_memory_seq_rm(). Metadata-only, no synchronization with the device.
+    // Returns false if the memory has no snapshot support / no spare cell / nothing to snapshot or roll back.
+    LLAMA_API bool llama_memory_seq_snapshot(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    LLAMA_API bool llama_memory_seq_rollback(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    LLAMA_API void llama_memory_seq_snapshot_clear(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Adds relative position "delta" to all tokens that belong to the specified sequence and have positions in [p0, p1)
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
@@ -1165,6 +1184,9 @@ extern "C" {
     // region currently selected (by default the one of the most recent decode). The caller must consume (read) a
     // decode's results before `n` further decodes are issued. n = 1 (default) is the classic behaviour.
     LLAMA_API bool    llama_output_slots_set(struct llama_context * ctx, int32_t n);
+    // reserve the output buffers for batches with up to n outputs (per output slot) now: growing them later
+    // reallocates the buffers, which drops the results of in-flight batches parked in other output slots
+    LLAMA_API bool    llama_output_reserve(struct llama_context * ctx, int32_t n);
     // wait only for the results of the selected output slot (equivalent to llama_synchronize when slots are not in use)
     LLAMA_API void    llama_output_synchronize(struct llama_context * ctx);
     // output slot used by the most recent llama_decode()

@@ -154,6 +154,13 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
+    // recurrent-state snapshots for speculative decoding: keep the sequence's current recurrent state in a spare
+    // cell so that a rejected draft can be rolled back without host copies (the attention part of a hybrid memory
+    // rolls back with seq_rm). Metadata-only, no GPU work. false = not supported / no spare cell / nothing to snapshot.
+    virtual bool seq_snapshot      (llama_seq_id seq_id) { GGML_UNUSED(seq_id); return false; }
+    virtual bool seq_rollback      (llama_seq_id seq_id) { GGML_UNUSED(seq_id); return false; }
+    virtual void seq_snapshot_clear(llama_seq_id seq_id) { GGML_UNUSED(seq_id); }
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 

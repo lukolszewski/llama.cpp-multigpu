@@ -310,6 +310,18 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_snap      = false; // the speculative checkpoint is a recurrent-state snapshot inside the memory (no host data)
+
+    bool spec_ckpt_ok() const {
+        return spec_snap || !spec_ckpt.empty();
+    }
+
+    void spec_snap_clear() {
+        if (spec_snap) {
+            llama_memory_seq_snapshot_clear(llama_get_memory(ctx_tgt), seq_id);
+            spec_snap = false;
+        }
+    }
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -658,6 +670,7 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
+        spec_snap_clear();
         mem.seq_rm(seq_id, -1, -1);
 
         server_reaper::instance().discard(std::move(prompt.checkpoints));
@@ -718,6 +731,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_snap_clear();
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -1416,6 +1430,9 @@ private:
 
     common_speculative_ptr spec;
 
+    bool spec_ckpt_snap   = true;  // speculative checkpoints as recurrent-state snapshots (LLAMA_SERVER_SPEC_CKPT_SYNC=1: host copies)
+    bool spec_snap_logged = false;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1856,6 +1873,24 @@ private:
             if (n_groups > 1 && !llama_output_slots_set(ctx_tgt, 2*n_groups)) {
                 SRV_WRN("%s", "LLAMA_SERVER_GROUPS ignored (llama_output_slots_set failed)\n");
                 n_groups = 1;
+            }
+            if (n_groups > 1 && spec) {
+                // a parked batch carries 1 + n_draft output rows per speculating slot; the output buffers must be
+                // sized for that now - growing them later reallocates while other groups' results are parked
+                // + one row per slot for prompt chunks of other groups' slots that ride along in this group's batch
+                const int n_slots_per_group = (params_base.n_parallel + n_groups - 1) / n_groups;
+                const int n_rows = n_slots_per_group * (1 + std::max(0, common_speculative_n_max(spec.get()))) + params_base.n_parallel;
+                if (!llama_output_reserve(ctx_tgt, n_rows)) {
+                    SRV_WRN("failed to reserve output buffers for %d rows\n", n_rows);
+                } else {
+                    SRV_INF("output buffers reserved for %d rows per output slot (speculative drafts in parked batches)\n", n_rows);
+                }
+            }
+            if (spec) {
+                spec_ckpt_snap = getenv("LLAMA_SERVER_SPEC_CKPT_SYNC") == nullptr;
+                if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                    SRV_INF("speculative checkpoints: %s\n", spec_ckpt_snap ? "recurrent-state snapshots when the memory has spare cells" : "synchronous host copies (LLAMA_SERVER_SPEC_CKPT_SYNC)");
+                }
             }
             if (n_groups > 1) {
                 // every decode batch must take the stream-agnostic graph class (shared across groups)
@@ -4015,6 +4050,7 @@ private:
         const llama_seq_id s_dst = dst.seq_id;
 
         // the buffer copy itself is applied by the next llama_decode() (see llama_kv_cache::update)
+        src.spec_snap_clear();
         src.mem.seq_cp(s_src, s_dst, -1, -1);
         src.mem.seq_rm(s_src, -1, -1);
 
@@ -4679,7 +4715,7 @@ private:
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
-                            GGML_ASSERT(!slot.spec_ckpt.empty());
+                            GGML_ASSERT(slot.spec_ckpt_ok());
                         }
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
@@ -4751,17 +4787,28 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
+                    // the recurrent state before the draft: a snapshot inside the memory (metadata only, the draft's
+                    // tokens are written to a fresh cell - no drain of the pipeline), host copy as the fallback
+                    slot.spec_snap = spec_ckpt_snap && llama_memory_seq_snapshot(llama_get_memory(ctx_tgt), slot.seq_id);
 
-                    ckpt.update_tgt(ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (slot.spec_snap) {
+                        ckpt.clear_tgt();
 
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+                        if (!spec_snap_logged) {
+                            spec_snap_logged = true;
+                            SRV_INF("%s", "speculative checkpoints are recurrent-state snapshots (no host copies, no drains)\n");
+                        }
 
-                    SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
-                            ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
-                            (float) ckpt.size() / 1024 / 1024,
-                            (float) ckpt.data_dft.size() / 1024 / 1024);
+                        SLT_DBG(slot, "created speculative snapshot (pos_min = %d, pos_max = %d, n_tokens = %d)\n",
+                                ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens());
+                    } else {
+                        ckpt.update_tgt(ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                        SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
+                                ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
+                                (float) ckpt.size() / 1024 / 1024,
+                                (float) ckpt.data_dft.size() / 1024 / 1024);
+                    }
                 }
 
                 if (use_ckpt_dft) {
@@ -5709,6 +5756,10 @@ private:
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
+            if (n_groups > 1 && slot.group != cur_group) {
+                // another group's slot holds the indices of ITS parked batch
+                return;
+            }
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
@@ -5825,6 +5876,10 @@ private:
 
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
+            if (n_groups > 1 && slot.group != cur_group) {
+                // another group's draft is verified by ITS parked batch (its spec_i_batch indexes that batch)
+                return;
+            }
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
@@ -5887,7 +5942,13 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                        if (slot.spec_snap) {
+                            if (!llama_memory_seq_rollback(llama_get_memory(slot.ctx_tgt), slot.seq_id)) {
+                                GGML_ABORT("speculative snapshot rollback failed for seq %d\n", slot.seq_id);
+                            }
+                        } else {
+                            GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                        }
 
                         if (slot.ctx_dft) {
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));

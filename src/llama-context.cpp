@@ -203,6 +203,8 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    cparams.n_rs_snap = params.n_rs_snap;
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -418,6 +420,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+    LLAMA_LOG_INFO("%s: n_rs_snap             = %u\n",   __func__, cparams.n_rs_snap);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
 
@@ -1088,6 +1091,10 @@ float * llama_context::get_logits() {
     output_reorder();
 
     return logits.data ? logits.data + out_row_base*model.vocab.n_tokens() : nullptr;
+}
+
+bool llama_context::output_reserve_rows(int32_t n_outputs) {
+    return output_reserve(n_outputs) >= (uint32_t) n_outputs;
 }
 
 bool llama_context::output_slots_set(int32_t n) {
@@ -2479,7 +2486,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    // the per-slot regions (rows_per_slot in decode()) derive from logits.size: keep the capacity monotonic so that
+    // batches of different sizes parked in different output slots never overlap
+    const int64_t n_outputs_max = std::max<int64_t>({(int64_t) n_outputs, (int64_t) n_seq_max(), (int64_t) n_outputs_cap});
+    n_outputs_cap = (uint32_t) n_outputs_max;
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -2541,6 +2551,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
+            bool pending = false;
+            for (const auto & s : out_slots) {
+                pending |= s.pending;
+            }
+            if (n_out_slots > 1 && pending) {
+                // the parked batches' results live in the old buffer: the caller must reserve enough rows up front
+                LLAMA_LOG_WARN("%s: reallocating output buffer (%.1f -> %.1f MiB) with %d output slots - results parked in other slots are lost\n",
+                        __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0, n_out_slots);
+            }
             synchronize();
 
             // TODO: not needed?
@@ -4405,6 +4424,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.n_rs_snap                   =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
@@ -4644,6 +4664,13 @@ bool llama_output_slots_set(llama_context * ctx, int32_t n) {
     return ctx->output_slots_set(n);
 }
 
+bool llama_output_reserve(llama_context * ctx, int32_t n) {
+    if (n < 1) {
+        return false;
+    }
+    return ctx->output_reserve_rows(n);
+}
+
 void llama_output_synchronize(llama_context * ctx) {
     ctx->output_synchronize();
 }
@@ -4854,6 +4881,36 @@ void llama_memory_seq_cp(
     }
 
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_seq_snapshot(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_snapshot(seq_id);
+}
+
+bool llama_memory_seq_rollback(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_rollback(seq_id);
+}
+
+void llama_memory_seq_snapshot_clear(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return;
+    }
+
+    mem->seq_snapshot_clear(seq_id);
 }
 
 void llama_memory_seq_keep(
