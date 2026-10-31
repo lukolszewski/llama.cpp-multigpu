@@ -1132,8 +1132,11 @@ private:
     int32_t prefill_chunk_with_decode = -1;
     int32_t prefill_max_with_decode   = 1;
     // issue one prefill chunk per update_slots() call in addition to the rotating group's batch, so the chunks
-    // pipeline back to back while the decoders' tokens interleave (LLAMA_SERVER_PREFILL_EAGER=0 disables)
-    bool    prefill_eager             = true;
+    // pipeline back to back while the decoders' tokens interleave (LLAMA_SERVER_PREFILL_EAGER=1 enables).
+    // OFF by default: with CUDA graphs and the non-draining scheduler re-plan it corrupts the decoders' output after a
+    // few hundred tokens (fine with direct kernel launches, GGML_CUDA_GRAPHS_FORCE=0); the ggml-cuda side is not
+    // understood yet - see airun/plan-prefill-and-cache.md A.
+    bool    prefill_eager             = false;
     bool    prefill_chunked           = false; // state of the last pre_decode(), for logging
 
     llama_model   * model_dft = nullptr;
