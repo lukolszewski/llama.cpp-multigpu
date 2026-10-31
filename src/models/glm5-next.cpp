@@ -260,10 +260,21 @@ public:
 
     // compact decode attention: gather the selected latent rows from the flat all-stream cache (row = cell + strm*kv_size)
     // instead of masking the stream's K view, so the graph does not depend on the stream. Always for the per-sequence
-    // ubatches of LLAMA_DECODE_PIPELINE, opt-in for every single-token ubatch with LLAMA_DSA_COMPACT=1.
+    // ubatches of LLAMA_DECODE_PIPELINE. Other single-token ubatches use it once n_kv reaches LLAMA_DSA_COMPACT_MIN_KV
+    // (default 16384): the masked path converts the whole quantized K view to f16 per DSA layer, which dominates at
+    // depth (q8_0 250k solo: 22.2 -> 26.0 t/s), while at short depth the gather costs ~4 %.
+    // LLAMA_DSA_COMPACT=1 forces it for every single-token ubatch, =0 only for the pipelined ones.
     static bool want_compact(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ub) {
-        static const bool env = getenv("LLAMA_DSA_COMPACT") != nullptr && atoi(getenv("LLAMA_DSA_COMPACT")) != 0;
-        return ub.n_tokens == 1 && (mctx->decode_pipelined() || env);
+        static const int env = getenv("LLAMA_DSA_COMPACT") != nullptr ? atoi(getenv("LLAMA_DSA_COMPACT")) : -1;
+        static const uint32_t min_kv = getenv("LLAMA_DSA_COMPACT_MIN_KV") != nullptr ?
+            (uint32_t) atoi(getenv("LLAMA_DSA_COMPACT_MIN_KV")) : 16384u;
+        if (ub.n_tokens != 1) {
+            return false;
+        }
+        if (mctx->decode_pipelined() || env == 1) {
+            return true;
+        }
+        return env != 0 && mctx->get_idx() != nullptr && mctx->get_idx()->get_n_kv() >= min_kv;
     }
 
     bool can_reuse(const llm_graph_params & params) override {
