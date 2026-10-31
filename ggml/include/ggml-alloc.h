@@ -61,6 +61,15 @@ GGML_API void ggml_gallocr_reserve_n_size(
     const int * node_buffer_ids,
     const int * leaf_buffer_ids,
     size_t * sizes);
+// like ggml_gallocr_reserve_n, but calls before_realloc(ud) once, right before the first buffer is freed and
+// re-allocated (only buffers that must grow are re-allocated); callers use it to synchronize lazily
+GGML_API bool ggml_gallocr_reserve_n_cb(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids,
+    void (*before_realloc)(void * ud),
+    void * ud);
 GGML_API bool ggml_gallocr_reserve_n(
     ggml_gallocr_t galloc,
     struct ggml_cgraph * graph,

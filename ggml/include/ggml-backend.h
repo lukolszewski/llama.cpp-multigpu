@@ -312,6 +312,9 @@ extern "C" {
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
+    // request input staging (pinned, asynchronous input copies) for the next graph computes; only meaningful with
+    // pipeline parallelism and a graph that is reused across overlapping computes (default: off)
+    GGML_API void                 ggml_backend_sched_set_stage_inputs(ggml_backend_sched_t sched, bool enable);
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
     //
@@ -366,6 +369,11 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    // Re-record the per-backend completion events of the last compute at the current stream positions. Call it after
+    // enqueuing asynchronous reads of the graph's outputs (ggml_backend_tensor_get_async): the scheduler orders the next
+    // graph's cross-backend input copies after these events, so without it a later graph may overwrite an output
+    // tensor before its read-out has executed.
+    GGML_API void                 ggml_backend_sched_record_events(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
