@@ -4440,10 +4440,19 @@ private:
             int32_t max_partial = params_base.prefill_max_partial;
             if (n_groups > 1) {
                 int n_generating = 0;
+                int n_prefilling = 0;
                 for (const auto & slot : slots) {
-                    n_generating += slot.is_processing() && slot.state == SLOT_STATE_GENERATING ? 1 : 0;
+                    if (!slot.is_processing()) {
+                        continue;
+                    }
+                    n_generating += slot.state == SLOT_STATE_GENERATING ? 1 : 0;
+                    n_prefilling += slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED ? 1 : 0;
                 }
-                const bool chunked = n_generating > 0 && prefill_chunk_with_decode > 0;
+                // chunk only while the decoders outnumber the prefilling slots: chunks buy decoder latency at the cost of
+                // prefill throughput (~70 ms of host time per chunk), so a prefill-heavy phase (5 prompts arriving at once)
+                // keeps whole batches. LLAMA_SERVER_PREFILL_CHUNK_ALWAYS=1 chunks whenever anyone decodes.
+                static const bool chunk_always = getenv("LLAMA_SERVER_PREFILL_CHUNK_ALWAYS") != nullptr && atoi(getenv("LLAMA_SERVER_PREFILL_CHUNK_ALWAYS")) != 0;
+                const bool chunked = n_generating > 0 && prefill_chunk_with_decode > 0 && (chunk_always || n_generating >= n_prefilling);
                 if (chunked) {
                     n_batch_eff = std::min(n_batch, prefill_chunk_with_decode);
                     if (prefill_max_with_decode > 0) {
@@ -4452,8 +4461,8 @@ private:
                 }
                 if (chunked != prefill_chunked) {
                     prefill_chunked = chunked;
-                    SRV_DBG("prefill chunking %s (%d generating, budget %d, max %d slot(s))\n",
-                            chunked ? "on" : "off", n_generating, n_batch_eff, max_partial);
+                    SRV_DBG("prefill chunking %s (%d generating, %d prefilling, budget %d, max %d slot(s))\n",
+                            chunked ? "on" : "off", n_generating, n_prefilling, n_batch_eff, max_partial);
                 }
             }
 
