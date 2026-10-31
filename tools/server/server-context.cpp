@@ -312,6 +312,14 @@ struct server_slot {
     bool spec_is_replay = false;
     bool spec_snap      = false; // the speculative checkpoint is a recurrent-state snapshot inside the memory (no host data)
 
+    // acceptance gate: a draft round costs ~2 graph re-plans of the shared pipeline whatever its length, and every
+    // generating user pays for it, so drafting only pays while enough draft tokens get accepted per round (EMA,
+    // threshold = spec_min_accept x generating users); below it the slot stops drafting and probes again after
+    // spec_backoff rounds (doubling while the probes fail). Starts optimistic (the first rounds draft).
+    float spec_accept_ema = 48.0f;
+    int   spec_skip       = 0;
+    int   spec_backoff    = 16;
+
     bool spec_ckpt_ok() const {
         return spec_snap || !spec_ckpt.empty();
     }
@@ -732,6 +740,9 @@ struct server_slot {
             spec_i_batch.clear();
             spec_ckpt.clear();
             spec_snap_clear();
+            spec_accept_ema = 48.0f;
+            spec_skip       = 0;
+            spec_backoff    = 16;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -1432,6 +1443,7 @@ private:
 
     bool spec_ckpt_snap   = true;  // speculative checkpoints as recurrent-state snapshots (LLAMA_SERVER_SPEC_CKPT_SYNC=1: host copies)
     int  spec_max_users   = 0;     // draft only while at most this many slots generate (0 = always); LLAMA_SERVER_SPEC_MAX_USERS
+    float spec_min_accept = 2.5f;  // keep drafting while the EMA of accepted draft tokens per round is >= this x generating users (0 = always); LLAMA_SERVER_SPEC_MIN_ACCEPT
     bool spec_snap_logged = false;
 
     bool add_bos_token = true;
@@ -1895,7 +1907,12 @@ private:
                 if (const char * e = getenv("LLAMA_SERVER_SPEC_MAX_USERS")) {
                     spec_max_users = std::max(0, atoi(e));
                 }
-                SRV_INF("speculative drafts: %s\n", spec_max_users > 0 ? string_format("while at most %d slots generate (LLAMA_SERVER_SPEC_MAX_USERS)", spec_max_users).c_str() : "always");
+                if (const char * e = getenv("LLAMA_SERVER_SPEC_MIN_ACCEPT")) {
+                    spec_min_accept = std::max(0.0f, (float) atof(e));
+                }
+                SRV_INF("speculative drafts: %s; acceptance gate: %s\n",
+                        spec_max_users > 0 ? string_format("while at most %d slots generate (LLAMA_SERVER_SPEC_MAX_USERS)", spec_max_users).c_str() : "any number of users",
+                        spec_min_accept > 0 ? string_format("EMA of accepted tokens per round >= %.1f x generating users (LLAMA_SERVER_SPEC_MIN_ACCEPT), probes with backoff 16..256 rounds", spec_min_accept).c_str() : "off");
                 if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                     SRV_INF("speculative checkpoints: %s\n", spec_ckpt_snap ? "recurrent-state snapshots when the memory has spare cells" : "synchronous host copies (LLAMA_SERVER_SPEC_CKPT_SYNC)");
                 }
@@ -4686,7 +4703,7 @@ private:
 
         // generating slots over all groups (the speculation cap counts everybody, not just this group)
         int n_gen_all = 0;
-        if (spec && spec_max_users > 0) {
+        if (spec && (spec_max_users > 0 || spec_min_accept > 0)) {
             iterate(slots, [&](server_slot & slot) {
                 n_gen_all += slot.state == SLOT_STATE_GENERATING ? 1 : 0;
             });
@@ -4721,9 +4738,19 @@ private:
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 // over the cap: no NEW drafts (a pending replay of accepted tokens still goes through)
-                const bool spec_capped = spec_max_users > 0 && n_gen_all > spec_max_users && slot.spec_draft.empty();
+                bool spec_hold = spec_max_users > 0 && n_gen_all > spec_max_users && slot.spec_draft.empty();
 
-                const int n_draft_max = spec_capped ? 0 : slot.get_n_draft_max();
+                // acceptance gate (see spec_accept_ema): hold while cold, probe every spec_backoff rounds
+                if (!spec_hold && spec_min_accept > 0 && slot.spec_draft.empty() && slot.spec_accept_ema < spec_min_accept * std::max(1, n_gen_all)) {
+                    if (slot.spec_skip < slot.spec_backoff) {
+                        slot.spec_skip++;
+                        spec_hold = true;
+                    } else {
+                        slot.spec_skip = 0; // probe
+                    }
+                }
+
+                const int n_draft_max = spec_hold ? 0 : slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -5938,6 +5965,22 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                if (!slot.spec_is_replay && spec_min_accept > 0) {
+                    // accepted draft tokens of this round (the replay of already accepted tokens carries no information);
+                    // the threshold scales with the users sharing the pipeline, see spec_accept_ema
+                    int n_gen_all = 0;
+                    iterate(slots, [&](server_slot & s) { n_gen_all += s.state == SLOT_STATE_GENERATING ? 1 : 0; });
+                    const float thr = spec_min_accept * std::max(1, n_gen_all);
+                    const float acc = (float) (accepted.size() - 1);
+                    slot.spec_accept_ema = 0.5f * slot.spec_accept_ema + 0.5f * acc;
+                    if (slot.spec_accept_ema >= thr) {
+                        // warm again (one good round is not enough: quotes alternate with rejected drafts)
+                        slot.spec_backoff = 16;
+                    } else {
+                        slot.spec_backoff = std::min(256, 2 * slot.spec_backoff);
+                    }
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
