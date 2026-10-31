@@ -406,9 +406,13 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     std::vector<uint32_t> rep_gen; // per global cell, the generation that last marked a pool with that rep
     uint32_t generation = 0;
 
-    uint32_t n_pool_real = 0;
-    uint32_t n_new       = 0;
-    uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
+    uint32_t n_pool_real  = 0; // pools of the sequences in the ubatch
+    uint32_t n_pool_graph = 0; // pool list size the graph is built for, stable across decode groups
+    uint32_t n_new        = 0;
+    uint32_t n_new_g      = 1; // graph size of the new pool list, stable across decode steps
+
+    std::array<uint8_t, LLAMA_MAX_SEQ> inc{}; // sequences whose pools the ubatch lists
+    llama_memory_hybrid_idx::stale_pos_t pending_next = llama_memory_hybrid_idx::stale_pos_clean();
 };
 
 namespace {
@@ -538,6 +542,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_pool_graph = st.n_pool_real;
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
         kpool_st = std::make_unique<kpool_state>(std::move(st));
@@ -562,6 +567,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_pool_graph = st.n_pool_real;
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
         kpool_st = std::make_unique<kpool_state>(std::move(st));
@@ -601,6 +607,9 @@ bool llama_memory_hybrid_idx_context::next() {
     // Clear only after a successful ubatch.
     if (i_cur == 0 && mem != nullptr) {
         mem->mem_idx_stale_clear();
+    }
+    if (mem != nullptr && kpool_st && i_kpool == i_cur) {
+        mem->kpool_stale_pending = kpool_st->pending_next;
     }
 
     if (ctx_idx) {
@@ -703,7 +712,10 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
     const auto & lay = mem->kpool_layout_get();
 
     kpool_state st;
-    st.n_pool_real = lay.n_pool_real;
+    st.n_pool_real  = lay.n_pool_real;
+    st.n_pool_graph = lay.n_pool_real;
+    st.inc.fill(1);
+    st.pending_next = mem->kpool_stale_pending;
 
     return st;
 }
@@ -725,14 +737,39 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const uint32_t kv_size = idx->get_size();
     const uint32_t kpool   = mem->get_kpool();
 
-    st.n_pool_real = lay.n_pool_real;
+    // only the pools of the ubatch's own sequences are scored, a token never sees another sequence's pools;
+    // LLAMA_KPOOL_ALL_SEQS=1 lists every sequence's pools as before (A/B)
+    static const bool all_seqs = [] {
+        const char * e = getenv("LLAMA_KPOOL_ALL_SEQS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    st.inc.fill(all_seqs ? 1 : 0);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            st.inc[ubatch.seq_id[i][k]] = 1;
+        }
+    }
+    uint32_t n_inc = 0;
+    size_t   max_pools = 0;
+    st.n_pool_real = 0;
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        max_pools = std::max(max_pools, lay.seqs[s].pools.size());
+        if (st.inc[s]) {
+            ++n_inc;
+            st.n_pool_real += (uint32_t) lay.seqs[s].pools.size();
+        }
+    }
+    // decode groups each carry one sequence: size the list by the longest sequence so every group shares one graph
+    st.n_pool_graph = ubatch.n_tokens >= 256 ? st.n_pool_real :
+        std::max(st.n_pool_real, std::min(lay.n_pool_real, n_inc*(uint32_t) max_pools));
+
     st.n_new       = 0;
     if (++st.generation == 0) {
         std::fill(st.is_new.begin(),  st.is_new.end(),  0);
         std::fill(st.rep_gen.begin(), st.rep_gen.end(), 0);
         st.generation = 1;
     }
-    st.is_new.resize(lay.n_pool_real, 0);
+    st.is_new.resize(st.n_pool_real, 0);
     st.rep_gen.resize((size_t) kv_size*idx->get_n_stream(), 0);
 
     std::array<uint32_t, LLAMA_MAX_SEQ> pool_start;
@@ -753,11 +790,17 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         const auto & sq = lay.seqs[s];
         pool_start[s] = ip;
-        ip += (uint32_t) sq.pools.size();
 
         // A sequence edit invalidates only pools ending after the edited position.
-        const llama_pos stale_from = i_cur == 0 ?
-            mem_idx_stale_batch[s] : llama_memory_hybrid_idx::POS_CLEAN;
+        const llama_pos stale_from = std::min(mem->kpool_stale_pending[s], i_cur == 0 ?
+            mem_idx_stale_batch[s] : llama_memory_hybrid_idx::POS_CLEAN);
+        if (!st.inc[s]) {
+            st.pending_next[s] = stale_from;
+            continue;
+        }
+        st.pending_next[s] = llama_memory_hybrid_idx::POS_CLEAN;
+        ip += (uint32_t) sq.pools.size();
+
         if (stale_from == llama_memory_hybrid_idx::POS_CLEAN) {
             continue;
         }
@@ -804,7 +847,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_graph) - 1, n_pool_max})});
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
@@ -814,7 +857,7 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
-    return kpool_pad(kpool_cur().n_pool_real);
+    return kpool_pad(kpool_cur().n_pool_graph);
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
@@ -844,7 +887,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     const bool by_order = mem->get_kpool_by_order();
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
+    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_graph));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
@@ -933,6 +976,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         const auto & sq = lay.seqs[s];
         seq_pool_start[s] = (uint32_t) pool_end.size();
+        if (!st.inc[s]) {
+            continue;
+        }
 
         const bool inert = n_stream_kv > 1 && !seq_in_ub[s];
 
@@ -975,7 +1021,14 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
     if (n_new_g > n_new) {
-        std::vector<int64_t> reps(pcell, pcell + pool_end.size());
+        // every sequence's reps, listed or not: a pad entry must not clobber a pooled key another ubatch reads
+        std::vector<int64_t> reps;
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            const auto & sq = lay.seqs[s];
+            for (const uint32_t j : sq.pools) {
+                reps.push_back(gcell(sq, sq.cells[j + kpool - 1].second));
+            }
+        }
         std::sort(reps.begin(), reps.end());
 
         int64_t pad_cell = 0;

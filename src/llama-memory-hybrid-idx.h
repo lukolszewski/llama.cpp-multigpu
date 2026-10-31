@@ -110,6 +110,10 @@ public:
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
+    // A ubatch scores and re-pools only its own sequences' pools. A stale sequence absent from the ubatch keeps
+    // its stale position here until a ubatch includes it, so its pooled keys are rebuilt before they are read.
+    stale_pos_t kpool_stale_pending = stale_pos_clean();
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
