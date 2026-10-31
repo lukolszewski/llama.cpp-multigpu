@@ -1124,6 +1124,13 @@ private:
         int32_t      out_slot = 0;
     };
     std::vector<pending_batch> pending;
+    // group mode only: while any other slot is generating, prompt tokens are issued in batches of at most
+    // prefill_chunk_with_decode tokens (default one ubatch; LLAMA_SERVER_PREFILL_CHUNK, 0 disables) by at most
+    // prefill_max_with_decode slots (default 1; LLAMA_SERVER_PREFILL_MAX_WITH_DECODE, 0 = no override), so the
+    // decoders' 1-token batches queue behind one ubatch per card instead of a whole n_batch
+    int32_t prefill_chunk_with_decode = -1;
+    int32_t prefill_max_with_decode   = 1;
+    bool    prefill_chunked           = false; // state of the last pre_decode(), for logging
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -1575,6 +1582,16 @@ private:
                 // every decode batch must take the stream-agnostic graph class (shared across groups)
                 setenv("LLAMA_DECODE_PIPELINE", "2", 1);
                 SRV_INF("pipelined decode groups: %d (slot i -> group i %% %d), LLAMA_DECODE_PIPELINE=2\n", n_groups, n_groups);
+
+                prefill_chunk_with_decode = (int32_t) llama_n_ubatch(ctx_tgt);
+                if (const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK")) {
+                    prefill_chunk_with_decode = atoi(e);
+                }
+                if (const char * e = getenv("LLAMA_SERVER_PREFILL_MAX_WITH_DECODE")) {
+                    prefill_max_with_decode = atoi(e);
+                }
+                SRV_INF("prefill while others decode: chunk %d tokens (0 = n_batch), at most %d slot(s) (0 = prefill_max_partial)\n",
+                        prefill_chunk_with_decode, prefill_max_with_decode);
             }
         }
 
@@ -3735,7 +3752,7 @@ private:
 
     // Decide which slots may add prompt tokens to the next batch (see the call site in
     // update_slots) and account waiting time. Returns the per-slot share of the given budget.
-    int32_t prefill_admit(int32_t n_budget) {
+    int32_t prefill_admit(int32_t n_budget, int32_t max_partial) {
         struct cand_t {
             server_slot * slot;
             int32_t remaining;
@@ -3786,7 +3803,7 @@ private:
 
             const bool is_long = c.remaining > params_base.prefill_long_threshold;
 
-            bool admit = n_admitted < params_base.prefill_max_partial;
+            bool admit = n_admitted < max_partial;
             if (admit && is_long && n_long >= params_base.prefill_max_long) {
                 admit = false;
             }
@@ -4356,10 +4373,32 @@ private:
             // slots share the remaining batch equally, unused share flows to the next one.
             // With the defaults (1 / 1) this is exactly first come first served: the first
             // slot takes the whole batch, as before.
-            const int32_t n_batch_share = prefill_admit(n_batch - batch.size());
+            // group mode: while another slot is generating, prefill in small chunks (see prefill_chunk_with_decode)
+            int32_t n_batch_eff = n_batch;
+            int32_t max_partial = params_base.prefill_max_partial;
+            if (n_groups > 1) {
+                int n_generating = 0;
+                for (const auto & slot : slots) {
+                    n_generating += slot.is_processing() && slot.state == SLOT_STATE_GENERATING ? 1 : 0;
+                }
+                const bool chunked = n_generating > 0 && prefill_chunk_with_decode > 0;
+                if (chunked) {
+                    n_batch_eff = std::min(n_batch, prefill_chunk_with_decode);
+                    if (prefill_max_with_decode > 0) {
+                        max_partial = std::min(max_partial, prefill_max_with_decode);
+                    }
+                }
+                if (chunked != prefill_chunked) {
+                    prefill_chunked = chunked;
+                    SRV_DBG("prefill chunking %s (%d generating, budget %d, max %d slot(s))\n",
+                            chunked ? "on" : "off", n_generating, n_batch_eff, max_partial);
+                }
+            }
+
+            const int32_t n_batch_share = prefill_admit(n_batch_eff - batch.size(), max_partial);
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_eff) {
                     return; // batch is full, skip remaining slots
                 }
                 if (n_groups > 1 && slot.group != cur_group) {
@@ -4852,7 +4891,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch (at most this slot's share)
-                    const int32_t n_batch_slot = std::min<int32_t>(n_batch, n_tokens_prev + n_batch_share);
+                    const int32_t n_batch_slot = std::min<int32_t>(n_batch_eff, n_tokens_prev + n_batch_share);
 
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
