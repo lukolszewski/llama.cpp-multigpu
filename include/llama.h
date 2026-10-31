@@ -964,8 +964,10 @@ extern "C" {
             struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags, size_t * n_bytes);
     // execute up to max_bytes of the pending copies; returns the bytes still pending (0 = done)
     LLAMA_API size_t llama_state_seq_job_step(struct llama_state_seq_job * job, size_t max_bytes);
-    // same, but every copy goes through the caller's staging buffer in chunks of at most staging_size bytes - with a
-    // pinned (host-backend) buffer the device copies become real DMA transfers instead of pageable staging
+    // same, but every copy goes through the caller's staging buffer - with a pinned (host-backend) buffer the device
+    // copies become real DMA transfers instead of pageable staging. The buffer is split between LLAMA_STATE_XFER_THREADS
+    // (default 4) threads that work disjoint ranges of the copies concurrently: host memcpy overlaps DMA, and copies
+    // to different devices use their PCIe links in parallel
     LLAMA_API size_t llama_state_seq_job_step_staged(struct llama_state_seq_job * job, size_t max_bytes, void * staging, size_t staging_size);
     LLAMA_API void   llama_state_seq_job_free(struct llama_state_seq_job * job);
 

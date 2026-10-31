@@ -18,6 +18,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <thread>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -5026,25 +5027,67 @@ size_t llama_state_seq_job_step(llama_state_seq_job * job, size_t max_bytes) {
 }
 
 size_t llama_state_seq_job_step_staged(llama_state_seq_job * job, size_t max_bytes, void * staging, size_t staging_size) {
-    if (staging == nullptr || staging_size == 0) {
+    // number of copy threads: the staging buffer is split in that many parts, each thread works a contiguous range of
+    // the copies with its own part and its own per-thread CUDA stream, so (a) the host memcpy of one thread overlaps
+    // the DMA of another and (b) copies to/from different devices (layers on different cards) run on their PCIe links
+    // in parallel instead of one card at a time
+    static const int n_threads = [] {
+        const char * s = getenv("LLAMA_STATE_XFER_THREADS");
+        const int n = s ? atoi(s) : 4;
+        return std::max(1, std::min(8, n));
+    }();
+
+    const size_t part = staging ? (staging_size / n_threads) & ~(size_t) (4096 - 1) : 0;
+
+    if (staging == nullptr || part < (size_t) 1 << 20) {
         return llama_state_seq_job_step(job, max_bytes);
     }
+
+    struct chunk {
+        const llama_state_seq_job::copy * c;
+        size_t off;
+        size_t n;
+    };
+    std::vector<chunk> chunks;
+
     size_t done = 0;
     while (job->next < job->copies.size() && done < max_bytes) {
         const auto & c = job->copies[job->next++];
-        for (size_t off = 0; off < c.size; off += staging_size) {
-            const size_t n = std::min(staging_size, c.size - off);
-            if (c.to_host) {
-                ggml_backend_tensor_get(c.tensor, staging, c.offset + off, n);
-                memcpy(c.ptr + off, staging, n);
-            } else {
-                memcpy(staging, c.ptr + off, n);
-                ggml_backend_tensor_set(c.tensor, staging, c.offset + off, n);
-            }
+        for (size_t off = 0; off < c.size; off += part) {
+            chunks.push_back({ &c, off, std::min(part, c.size - off) });
         }
         done += c.size;
         job->pending -= c.size;
     }
+
+    const int nt = (int) std::min<size_t>(n_threads, std::max<size_t>(1, chunks.size()));
+
+    auto run = [&](int tid) {
+        uint8_t * st = (uint8_t *) staging + (size_t) tid*part;
+        const size_t i0 = (chunks.size() * (size_t) tid)       / nt;
+        const size_t i1 = (chunks.size() * (size_t) (tid + 1)) / nt;
+        for (size_t i = i0; i < i1; ++i) {
+            const auto & ch = chunks[i];
+            const auto & c  = *ch.c;
+            if (c.to_host) {
+                ggml_backend_tensor_get(c.tensor, st, c.offset + ch.off, ch.n);
+                memcpy(c.ptr + ch.off, st, ch.n);
+            } else {
+                memcpy(st, c.ptr + ch.off, ch.n);
+                ggml_backend_tensor_set(c.tensor, st, c.offset + ch.off, ch.n);
+            }
+        }
+    };
+
+    std::vector<std::thread> helpers;
+    for (int t = 1; t < nt; ++t) {
+        helpers.emplace_back(run, t);
+    }
+    run(0);
+    for (auto & h : helpers) {
+        h.join();
+    }
+
     return job->pending;
 }
 
