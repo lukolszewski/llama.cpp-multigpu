@@ -1572,7 +1572,9 @@ private:
                 n_groups = 1;
             }
             if (n_groups > 1) {
-                SRV_INF("pipelined decode groups: %d (slot i -> group i %% %d)\n", n_groups, n_groups);
+                // every decode batch must take the stream-agnostic graph class (shared across groups)
+                setenv("LLAMA_DECODE_PIPELINE", "2", 1);
+                SRV_INF("pipelined decode groups: %d (slot i -> group i %% %d), LLAMA_DECODE_PIPELINE=2\n", n_groups, n_groups);
             }
         }
 

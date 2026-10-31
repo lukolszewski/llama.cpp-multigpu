@@ -194,6 +194,8 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    // padded n_kv over ALL streams (the deepest active sequence) - a shape floor shared by every decode batch
+    uint32_t get_n_kv_all() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;

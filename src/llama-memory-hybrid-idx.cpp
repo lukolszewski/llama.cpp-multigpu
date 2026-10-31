@@ -108,8 +108,11 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 // per-sequence ubatches let the scheduler's pipeline overlap them across the cards. The graph is not
                 // reused between ubatches of different sequences (allow_reuse keys on the sequence set), so this trades
                 // host-side graph builds for GPU overlap; off by default until measured.
-                static const bool decode_pipeline = getenv("LLAMA_DECODE_PIPELINE") != nullptr && atoi(getenv("LLAMA_DECODE_PIPELINE")) != 0;
-                if (decode_pipeline && !unified && ubatches.empty() && ubatch.n_tokens > 1 && ubatch.n_seq_tokens == 1 &&
+                // LLAMA_DECODE_PIPELINE=2: also single-sequence decode batches take the pipelined (stream-agnostic) class,
+                // with n_kv floored to the deepest active sequence, so that consecutive decode batches of different
+                // sequences (the server's pipelined groups) share one graph
+                static const int decode_pipeline = getenv("LLAMA_DECODE_PIPELINE") != nullptr ? atoi(getenv("LLAMA_DECODE_PIPELINE")) : 0;
+                if (decode_pipeline > 0 && !unified && ubatches.empty() && (ubatch.n_tokens > 1 || decode_pipeline >= 2) && ubatch.n_seq_tokens == 1 &&
                         ubatch.n_seqs > 1 && ubatch.n_tokens == balloc.get_n_tokens()) {
                     balloc.split_reset();
                     pipeline_split = true;
@@ -152,12 +155,17 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         // per-sequence decode ubatches (LLAMA_DECODE_PIPELINE): give them all the batch's largest n_kv so that
         // they build identical graph shapes and the graph is reused across streams
         uint32_t n_kv_min = 0;
-        if (ubatches.size() > 1) {
+        static const int decode_pipeline_lvl = getenv("LLAMA_DECODE_PIPELINE") != nullptr ? atoi(getenv("LLAMA_DECODE_PIPELINE")) : 0;
+        if (ubatches.size() > 1 || (decode_pipeline_lvl >= 2 && ubatches.size() == 1 && !embd_all)) {
             bool pure_decode = true;
             for (const auto & ub : ubatches) {
                 pure_decode &= ub.n_tokens == 1 && ub.n_seqs == 1;
             }
             if (pure_decode) {
+                if (decode_pipeline_lvl >= 2) {
+                    // one shape for every decode batch in the cache
+                    n_kv_min = get_mem_attn()->get_n_kv_all();
+                }
                 for (const auto & si : heads_attn) {
                     n_kv_min = std::max(n_kv_min, get_mem_attn()->get_n_kv(si));
                 }
