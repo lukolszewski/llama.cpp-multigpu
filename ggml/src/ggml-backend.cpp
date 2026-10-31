@@ -2097,7 +2097,7 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
-static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool * input_waited) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
@@ -2105,10 +2105,23 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-        } else {
-            ggml_backend_synchronize(split_backend);
+        //
+        // The wait protects the copy slot cur_copy of this backend, last used by the graph compute n_copies ago.
+        // The event of (backend, cur_copy) is re-recorded after every split of this compute, so for the second and
+        // later splits of a backend it would wait for *this* ubatch to reach that point, which serializes the
+        // pipeline whenever a backend has several splits (e.g. experts placed on another device than their layer).
+        // Waiting once, at the backend's first user-input copy of this compute, covers the slot for the whole compute.
+        // GGML_SCHED_INPUT_WAIT_EVERY=1 restores the per-split wait.
+        static const bool wait_every = getenv("GGML_SCHED_INPUT_WAIT_EVERY") != nullptr && atoi(getenv("GGML_SCHED_INPUT_WAIT_EVERY")) != 0;
+        if (wait_every || !input_waited || !input_waited[split_backend_id]) {
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            if (input_waited) {
+                input_waited[split_backend_id] = true;
+            }
         }
         ggml_backend_tensor_copy(input, input_cpy);
         return;
@@ -2145,6 +2158,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // per backend: the user-input copy slot of this compute has been waited for (see ggml_backend_sched_copy_input)
+    bool input_waited[GGML_SCHED_MAX_BACKENDS] = { false };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2164,12 +2180,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], input_waited);
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], input_waited);
             }
         }
 
