@@ -1122,14 +1122,18 @@ private:
         server_batch parked;
         int32_t      n_tokens = 0;
         int32_t      out_slot = 0;
+        bool         outputs  = false; // the batch has logits to sample on the next visit (false: a prompt chunk)
     };
     std::vector<pending_batch> pending;
     // group mode only: while any other slot is generating, prompt tokens are issued in batches of at most
-    // prefill_chunk_with_decode tokens (default one ubatch; LLAMA_SERVER_PREFILL_CHUNK, 0 disables) by at most
+    // prefill_chunk_with_decode tokens (default 256; LLAMA_SERVER_PREFILL_CHUNK, 0 disables) by at most
     // prefill_max_with_decode slots (default 1; LLAMA_SERVER_PREFILL_MAX_WITH_DECODE, 0 = no override), so the
     // decoders' 1-token batches queue behind one ubatch per card instead of a whole n_batch
     int32_t prefill_chunk_with_decode = -1;
     int32_t prefill_max_with_decode   = 1;
+    // issue one prefill chunk per update_slots() call in addition to the rotating group's batch, so the chunks
+    // pipeline back to back while the decoders' tokens interleave (LLAMA_SERVER_PREFILL_EAGER=0 disables)
+    bool    prefill_eager             = true;
     bool    prefill_chunked           = false; // state of the last pre_decode(), for logging
 
     llama_model   * model_dft = nullptr;
@@ -1583,12 +1587,18 @@ private:
                 setenv("LLAMA_DECODE_PIPELINE", "2", 1);
                 SRV_INF("pipelined decode groups: %d (slot i -> group i %% %d), LLAMA_DECODE_PIPELINE=2\n", n_groups, n_groups);
 
-                prefill_chunk_with_decode = (int32_t) llama_n_ubatch(ctx_tgt);
+                // 256 by default: the decoders' tokens trail one chunk per card, so the chunk's per-card time bounds their
+                // latency, while the host cost per chunk (~70 ms, mostly CUDA-graph capture) bounds the prefill rate;
+                // measured 2 × 12k decoders + 39k prefill: 256 → 420 ms gaps / 1.7k t/s, 512 → 700 ms / 2.0k, p2 → 1.3 s / 1.4k
+                prefill_chunk_with_decode = std::min<int32_t>(256, (int32_t) llama_n_ubatch(ctx_tgt));
                 if (const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK")) {
                     prefill_chunk_with_decode = atoi(e);
                 }
                 if (const char * e = getenv("LLAMA_SERVER_PREFILL_MAX_WITH_DECODE")) {
                     prefill_max_with_decode = atoi(e);
+                }
+                if (const char * e = getenv("LLAMA_SERVER_PREFILL_EAGER")) {
+                    prefill_eager = atoi(e) != 0;
                 }
                 SRV_INF("prefill while others decode: chunk %d tokens (0 = n_batch), at most %d slot(s) (0 = prefill_max_partial)\n",
                         prefill_chunk_with_decode, prefill_max_with_decode);
@@ -3923,127 +3933,173 @@ private:
             // a single active user gains nothing from the stream-agnostic graph (it costs ~5 % solo): use the
             // per-stream class while only one slot is processing; the switch costs one graph rebuild
             setenv("LLAMA_DECODE_PIPELINE", n_processing >= 2 ? "2" : "1", 1);
-            auto & pb = pending[cur_group];
-            if (pb.active) {
-                // results of this group's previous batch: sample them now (waits only for that batch)
-                std::swap(batch, pb.parked);
-                llama_output_select(ctx_tgt, pb.out_slot);
+        }
+
+        // serve the current group: sample its parked batch, build and issue its next batch
+        // (first: also the TTS / realtime slots, which bypass the shared batch)
+        auto serve_group = [&](bool first) {
+            if (n_groups > 1) {
+                auto & pb = pending[cur_group];
+                if (pb.active) {
+                    // results of this group's previous batch: sample them now (waits only for that batch)
+                    std::swap(batch, pb.parked);
+                    llama_output_select(ctx_tgt, pb.out_slot);
+                    try {
+                        scoped_timer t(t_post_decode, n_post_decode);
+                        post_decode(pb.n_tokens, 0);
+                    } catch (const std::exception & e) {
+                        SRV_ERR("post_decode() failed: %s\n", e.what());
+                        abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                    }
+                    pb.active = false;
+                }
+            }
+
+            try {
+                scoped_timer t(t_pre_decode, n_pre_decode);
+                pre_decode();
+            } catch (const std::exception & e) {
+                SRV_ERR("pre_decode() failed: %s\n", e.what());
+                abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+
+                // the batch is half-built and not rendered, skip now to avoid UB
+                return;
+            }
+
+            if (first) {
+                // note: TTS slots bypass the shared batch entirely
+                try {
+                    process_tts_slots();
+                } catch (const std::exception & e) {
+                    SRV_ERR("process_tts_slots() failed: %s\n", e.what());
+                    abort_all_slots("process_tts_slots() failed: " + std::string(e.what()));
+                }
+
+                // so do the realtime conversations
+                try {
+                    process_realtime_slots();
+                } catch (const std::exception & e) {
+                    SRV_ERR("process_realtime_slots() failed: %s\n", e.what());
+                    abort_all_slots("process_realtime_slots() failed: " + std::string(e.what()));
+                }
+            }
+
+            GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+
+            if (batch.slot_batched) {
+                auto & slot_batched      = batch.slot_batched;
+                auto & alora_scale       = batch.alora_scale;
+                auto & alora_disabled_id = batch.alora_disabled_id;
+
+                // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
+                // apply lora, only need to do it once per batch
+                common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+
+                // if the lora is temporarily disabled for an alora, re-enable it
+                // for next time
+                if (alora_scale > 0.0f) {
+                    SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
+                    slot_batched->lora[alora_disabled_id].scale = alora_scale;
+                }
+
+                llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            }
+
+            int32_t off_next = 0;
+            int32_t n_batch = llama_n_batch(ctx_tgt);
+            // pipelined groups: a batch that fits one view and needs no embeddings is issued and parked; its results are
+            // sampled on this group's next visit, while the other groups' batches compute
+            const bool defer = n_groups > 1 && batch.size() > 0 && batch.size() <= n_batch &&
+                !(batch.slot_batched && batch.slot_batched->need_embd());
+            for (int32_t off = 0; off < batch.size(); off = off_next) {
+                const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+                try {
+                    scoped_timer t(t_decode, n_decode);
+                    // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
+
+                    batch.render(off, n_tokens);
+                    decode_defer_sync = defer && off == 0 && n_tokens == batch.size();
+                    bool ok = decode(n_batch, off);
+                    if (ok && decode_defer_sync) {
+                        decode_defer_sync = false;
+                        auto & pb = pending[cur_group];
+                        pb.n_tokens = n_tokens;
+                        pb.out_slot = llama_output_slot(ctx_tgt);
+                        pb.outputs  = false;
+                        for (int32_t j = 0; j < n_tokens; ++j) {
+                            if (batch.tokens[off + j].output) {
+                                pb.outputs = true;
+                                break;
+                            }
+                        }
+                        pb.active   = true;
+                        std::swap(batch, pb.parked);
+                        break;
+                    }
+                    decode_defer_sync = false;
+    #ifdef DEBUG_TIMINGS
+                    if (debug_timings_enabled() && n_groups == 1) {
+                        llama_synchronize(ctx_tgt);
+                    }
+    #endif
+
+                    if (ok) {
+                        // move the head of the batch forward with the number of tokens we just processed
+                        off_next = off + n_tokens;
+
+                        // on successful decode, restore the original batch size
+                        n_batch = llama_n_batch(ctx_tgt);
+                    } else {
+                        // try again with the updated n_batch
+                        continue;
+                    }
+                } catch (const std::exception & e) {
+                    SRV_ERR("decode() failed: %s\n", e.what());
+                    abort_all_slots("decode() failed: " + std::string(e.what()));
+                    break; // stop any further processing
+                }
+
                 try {
                     scoped_timer t(t_post_decode, n_post_decode);
-                    post_decode(pb.n_tokens, 0);
+                    post_decode(n_tokens, off);
                 } catch (const std::exception & e) {
                     SRV_ERR("post_decode() failed: %s\n", e.what());
                     abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                    break; // stop any further processing
                 }
-                pb.active = false;
             }
-        }
+        };
 
-        try {
-            scoped_timer t(t_pre_decode, n_pre_decode);
-            pre_decode();
-        } catch (const std::exception & e) {
-            SRV_ERR("pre_decode() failed: %s\n", e.what());
-            abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+        serve_group(true);
 
-            // the batch is half-built and not rendered, skip now to avoid UB
-            return;
-        }
-
-        // note: TTS slots bypass the shared batch entirely
-        try {
-            process_tts_slots();
-        } catch (const std::exception & e) {
-            SRV_ERR("process_tts_slots() failed: %s\n", e.what());
-            abort_all_slots("process_tts_slots() failed: " + std::string(e.what()));
-        }
-
-        // so do the realtime conversations
-        try {
-            process_realtime_slots();
-        } catch (const std::exception & e) {
-            SRV_ERR("process_realtime_slots() failed: %s\n", e.what());
-            abort_all_slots("process_realtime_slots() failed: " + std::string(e.what()));
-        }
-
-        GGML_ASSERT(batch.slot_batched || batch.size() == 0);
-
-        if (batch.slot_batched) {
-            auto & slot_batched      = batch.slot_batched;
-            auto & alora_scale       = batch.alora_scale;
-            auto & alora_disabled_id = batch.alora_disabled_id;
-
-            // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
-            // apply lora, only need to do it once per batch
-            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
-
-            // if the lora is temporarily disabled for an alora, re-enable it
-            // for next time
-            if (alora_scale > 0.0f) {
-                SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
-                slot_batched->lora[alora_disabled_id].scale = alora_scale;
-            }
-
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
-        }
-
-        int32_t off_next = 0;
-        int32_t n_batch = llama_n_batch(ctx_tgt);
-        // pipelined groups: a batch that fits one view and needs no embeddings is issued and parked; its results are
-        // sampled on this group's next visit, while the other groups' batches compute
-        const bool defer = n_groups > 1 && batch.size() > 0 && batch.size() <= n_batch &&
-            !(batch.slot_batched && batch.slot_batched->need_embd());
-        for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
-            try {
-                scoped_timer t(t_decode, n_decode);
-                // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
-
-                batch.render(off, n_tokens);
-                decode_defer_sync = defer && off == 0 && n_tokens == batch.size();
-                bool ok = decode(n_batch, off);
-                if (ok && decode_defer_sync) {
-                    decode_defer_sync = false;
-                    auto & pb = pending[cur_group];
-                    pb.n_tokens = n_tokens;
-                    pb.out_slot = llama_output_slot(ctx_tgt);
-                    pb.active   = true;
-                    std::swap(batch, pb.parked);
-                    break;
-                }
-                decode_defer_sync = false;
-#ifdef DEBUG_TIMINGS
-                if (debug_timings_enabled() && n_groups == 1) {
-                    llama_synchronize(ctx_tgt);
-                }
-#endif
-
-                if (ok) {
-                    // move the head of the batch forward with the number of tokens we just processed
-                    off_next = off + n_tokens;
-
-                    // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
-                } else {
-                    // try again with the updated n_batch
+        if (n_groups > 1 && prefill_eager && prefill_chunk_with_decode > 0) {
+            // a prefill chunk is issued once per loop iteration regardless of the rotation, so the chunks follow each
+            // other through the pipeline while the decoders' tokens interleave; only while someone is decoding and
+            // the prefilling group's parked batch is not a final chunk waiting to be sampled
+            int n_generating = 0;
+            int g_prefill    = -1;
+            for (const auto & slot : slots) {
+                if (!slot.is_processing()) {
                     continue;
                 }
-            } catch (const std::exception & e) {
-                SRV_ERR("decode() failed: %s\n", e.what());
-                abort_all_slots("decode() failed: " + std::string(e.what()));
-                break; // stop any further processing
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    n_generating++;
+                }
+                if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) &&
+                        slot.group != cur_group && g_prefill < 0 &&
+                        !(pending[slot.group].active && pending[slot.group].outputs)) {
+                    g_prefill = slot.group;
+                }
             }
-
-            try {
-                scoped_timer t(t_post_decode, n_post_decode);
-                post_decode(n_tokens, off);
-            } catch (const std::exception & e) {
-                SRV_ERR("post_decode() failed: %s\n", e.what());
-                abort_all_slots("post_decode() failed: " + std::string(e.what()));
-                break; // stop any further processing
+            if (n_generating > 0 && g_prefill >= 0) {
+                const int g_main = cur_group;
+                cur_group = g_prefill;
+                serve_group(false);
+                cur_group = g_main;
             }
         }
     }
+
 
     // realtime conversations (SERVER_TASK_TYPE_REALTIME) drive their own decode loop, see server_realtime_slot
     void process_realtime_slots() {
