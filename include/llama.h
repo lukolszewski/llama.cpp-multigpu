@@ -964,7 +964,18 @@ extern "C" {
             struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags, size_t * n_bytes);
     // execute up to max_bytes of the pending copies; returns the bytes still pending (0 = done)
     LLAMA_API size_t llama_state_seq_job_step(struct llama_state_seq_job * job, size_t max_bytes);
+    // same, but every copy goes through the caller's staging buffer in chunks of at most staging_size bytes - with a
+    // pinned (host-backend) buffer the device copies become real DMA transfers instead of pageable staging
+    LLAMA_API size_t llama_state_seq_job_step_staged(struct llama_state_seq_job * job, size_t max_bytes, void * staging, size_t staging_size);
     LLAMA_API void   llama_state_seq_job_free(struct llama_state_seq_job * job);
+
+    // GPU fence: marks the current end of every backend's queue. Waiting on it (from any thread) guarantees that all
+    // work issued before the record - e.g. the ubatches that produced a sequence's state - has completed, without
+    // draining the context from the calling thread. NULL if the context has no backends.
+    struct llama_fence;
+    LLAMA_API struct llama_fence * llama_fence_record(struct llama_context * ctx);
+    LLAMA_API void                 llama_fence_wait  (struct llama_fence * fence);
+    LLAMA_API void                 llama_fence_free  (struct llama_fence * fence);
 
     //
     // Decoding

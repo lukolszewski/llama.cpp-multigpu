@@ -5025,8 +5025,76 @@ size_t llama_state_seq_job_step(llama_state_seq_job * job, size_t max_bytes) {
     return job->pending;
 }
 
+size_t llama_state_seq_job_step_staged(llama_state_seq_job * job, size_t max_bytes, void * staging, size_t staging_size) {
+    if (staging == nullptr || staging_size == 0) {
+        return llama_state_seq_job_step(job, max_bytes);
+    }
+    size_t done = 0;
+    while (job->next < job->copies.size() && done < max_bytes) {
+        const auto & c = job->copies[job->next++];
+        for (size_t off = 0; off < c.size; off += staging_size) {
+            const size_t n = std::min(staging_size, c.size - off);
+            if (c.to_host) {
+                ggml_backend_tensor_get(c.tensor, staging, c.offset + off, n);
+                memcpy(c.ptr + off, staging, n);
+            } else {
+                memcpy(staging, c.ptr + off, n);
+                ggml_backend_tensor_set(c.tensor, staging, c.offset + off, n);
+            }
+        }
+        done += c.size;
+        job->pending -= c.size;
+    }
+    return job->pending;
+}
+
 void llama_state_seq_job_free(llama_state_seq_job * job) {
     delete job;
+}
+
+// GPU fence: one event per backend, recorded on the backend's stream after everything issued so far
+struct llama_fence {
+    std::vector<ggml_backend_event_t> events;
+};
+
+llama_fence * llama_context::fence_record() {
+    auto * f = new llama_fence();
+    for (auto * backend : backend_ptrs) {
+        auto * dev = ggml_backend_get_device(backend);
+        if (!dev) {
+            continue;
+        }
+        ggml_backend_event_t ev = ggml_backend_event_new(dev);
+        if (!ev) {
+            continue; // backend without events (CPU): its work is synchronous
+        }
+        ggml_backend_event_record(ev, backend);
+        f->events.push_back(ev);
+    }
+    return f;
+}
+
+llama_fence * llama_fence_record(llama_context * ctx) {
+    return ctx->fence_record();
+}
+
+void llama_fence_wait(llama_fence * fence) {
+    if (!fence) {
+        return;
+    }
+    for (auto * ev : fence->events) {
+        ggml_backend_event_synchronize(ev);
+    }
+}
+
+void llama_fence_free(llama_fence * fence) {
+    if (!fence) {
+        return;
+    }
+    for (auto * ev : fence->events) {
+        ggml_backend_event_free(ev);
+    }
+    delete fence;
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

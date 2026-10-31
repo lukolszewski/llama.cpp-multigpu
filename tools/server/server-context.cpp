@@ -350,6 +350,7 @@ struct server_slot {
 
     // prefill admission (see server_context::update_slots), valid while the prompt is processed
     bool    prefill_admitted    = false; // may add prompt tokens to the current batch
+    int64_t ckpt_async_n_tokens = -1;    // prompt position whose context checkpoint was started asynchronously
     bool    prefill_waiting     = false; // has prompt tokens left but was not admitted
     bool    prefill_is_long     = false; // classification at the last admission decision
     int64_t t_prefill_wait_last = 0;     // when the current wait was last accounted, 0 = not waiting
@@ -397,11 +398,17 @@ struct server_slot {
     // prompt must not be processed (restore) meanwhile - see get_available_slot(), pre_decode(), prefill_admit().
     struct state_xfer {
         bool is_save = false;
+        bool is_ckpt = false;                        // context checkpoint (partial state) instead of a cache entry
         llama_state_seq_job * job_tgt = nullptr;
         llama_state_seq_job * job_dft = nullptr;
         server_prompt_cache_state * entry = nullptr; // save: the cache entry being filled
         server_prompt_data data;                     // restore: the source bytes (kept alive until done)
         bool clear_after = false;                    // save with a unified KV cache: clear the slot afterwards
+        std::vector<uint8_t> ckpt_data;              // checkpoint save: the destination bytes
+        int64_t ckpt_n_tokens = -1;                  // checkpoint save: the entry to fill on completion
+        llama_fence * fence = nullptr;               // wait for the GPU work that produced the state first
+        void * staging = nullptr;                    // pinned staging buffer (optional)
+        size_t staging_size = 0;
         std::thread th;
         std::atomic<bool> done{false};
 
@@ -411,19 +418,29 @@ struct server_slot {
             }
             if (job_tgt) { llama_state_seq_job_free(job_tgt); }
             if (job_dft) { llama_state_seq_job_free(job_dft); }
+            if (fence)   { llama_fence_free(fence); }
         }
     };
     std::unique_ptr<state_xfer> xfer;
+
+    void * xfer_staging      = nullptr; // pinned staging buffer for the transfer worker (owned by server_context)
+    size_t xfer_staging_size = 0;
+    bool   want_idle_save    = false;   // idle slot to be saved to the prompt cache (started one per update_slots)
 
     bool is_transferring() const { return xfer != nullptr; }
 
     void xfer_start(std::unique_ptr<state_xfer> x) {
         auto * raw = x.get();
+        raw->staging      = xfer_staging;
+        raw->staging_size = xfer_staging_size;
         xfer = std::move(x);
         xfer->th = std::thread([raw]() {
+            if (raw->fence) {
+                llama_fence_wait(raw->fence);
+            }
             for (auto * job : { raw->job_tgt, raw->job_dft }) {
                 if (job) {
-                    while (llama_state_seq_job_step(job, (size_t) 64 << 20) > 0) {
+                    while (llama_state_seq_job_step_staged(job, (size_t) 64 << 20, raw->staging, raw->staging_size) > 0) {
                     }
                 }
             }
@@ -440,13 +457,19 @@ struct server_slot {
             return false;
         }
 
+        const int64_t t0 = ggml_time_us();
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        const int64_t t1 = ggml_time_us();
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
+
+        const int64_t t2 = ggml_time_us();
 
         auto x = std::make_unique<state_xfer>();
         x->is_save     = true;
@@ -471,11 +494,61 @@ struct server_slot {
 
         cur->pending = true;
 
-        SLT_INF(*this, "saving prompt with length %d (%.1f MiB) to the cache asynchronously\n",
-                (int) prompt.tokens.size(), (cur_size_tgt + cur_size_dft) / (1024.0 * 1024.0));
+        SLT_INF(*this, "saving prompt with length %d (%.1f MiB) to the cache asynchronously (start: size %.1f ms, alloc %.1f ms, meta %.1f ms)\n",
+                (int) prompt.tokens.size(), (cur_size_tgt + cur_size_dft) / (1024.0 * 1024.0),
+                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (ggml_time_us() - t2) / 1000.0);
 
         xfer_start(std::move(x));
 
+        return true;
+    }
+
+    // start copying out the partial (recurrent / SWA) state for the context checkpoint at prompt position n_tokens:
+    // the worker waits for the GPU work issued so far, then copies - no drain of the other slots' pipeline. The slot
+    // must not decode until xfer_poll() reports completion (it is held by the prompt-processing loop).
+    bool checkpoint_save_async(int64_t ckpt_n_tokens) {
+        GGML_ASSERT(!is_transferring());
+
+        const size_t size = llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (size == 0) {
+            return false;
+        }
+
+        auto x = std::make_unique<state_xfer>();
+        x->is_save       = true;
+        x->is_ckpt       = true;
+        x->ckpt_n_tokens = ckpt_n_tokens;
+        x->ckpt_data.resize(size);
+
+        size_t n = 0;
+        x->job_tgt = llama_state_seq_get_data_begin(ctx_tgt, x->ckpt_data.data(), size, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &n);
+        if (!x->job_tgt || n != size) {
+            SLT_WRN(*this, "%s", "asynchronous checkpoint save failed to start\n");
+            return false;
+        }
+        x->fence = llama_fence_record(ctx_tgt);
+
+        SLT_DBG(*this, "saving context checkpoint at n_tokens = %" PRId64 " (%.3f MiB) asynchronously\n", ckpt_n_tokens, size / (1024.0 * 1024.0));
+
+        xfer_start(std::move(x));
+
+        return true;
+    }
+
+    // restore a context checkpoint without draining the context: the sequence has no work in flight (its last
+    // outputs were consumed before the slot was released), the other sequences' work touches other state rows
+    static bool checkpoint_load_nosync(llama_context * ctx, const std::vector<uint8_t> & data, llama_seq_id seq_id, llama_state_seq_flags flags) {
+        if (ctx == nullptr || data.empty()) {
+            return true;
+        }
+        size_t n = 0;
+        auto * job = llama_state_seq_set_data_begin(ctx, data.data(), data.size(), seq_id, flags, &n);
+        if (!job) {
+            return llama_state_seq_set_data_ext(ctx, data.data(), data.size(), seq_id, flags) != 0;
+        }
+        while (llama_state_seq_job_step(job, SIZE_MAX) > 0) {
+        }
+        llama_state_seq_job_free(job);
         return true;
     }
 
@@ -532,7 +605,20 @@ struct server_slot {
 
         xfer->th.join();
 
-        if (xfer->is_save) {
+        if (xfer->is_ckpt) {
+            bool stored = false;
+            for (auto & c : prompt.checkpoints) {
+                if (c.n_tokens == xfer->ckpt_n_tokens && c.data_tgt.empty()) {
+                    c.data_tgt = std::move(xfer->ckpt_data);
+                    stored = true;
+                    break;
+                }
+            }
+            SLT_DBG(*this, "asynchronous checkpoint save done (n_tokens = %" PRId64 ", stored = %d)\n", xfer->ckpt_n_tokens, stored);
+            if (!stored) {
+                // the entry is gone (task aborted and the prompt cleared): nothing to keep
+            }
+        } else if (xfer->is_save) {
             if (xfer->entry) {
                 xfer->entry->pending = false;
             }
@@ -628,6 +714,7 @@ struct server_slot {
         prefill_admitted    = false;
         prefill_waiting     = false;
         prefill_is_long     = false;
+        ckpt_async_n_tokens = -1;
         t_prefill_wait_last = 0;
         n_accepted_per_pos.clear();
 
@@ -1320,6 +1407,11 @@ private:
     int32_t n_swa;
 
     // slots / clients
+    // pinned staging buffers of the slots' transfer workers (declared before the slots: freed after them)
+    struct xfer_staging_pool_t {
+        std::vector<ggml_backend_buffer_t> bufs;
+        ~xfer_staging_pool_t() { for (auto * b : bufs) { ggml_backend_buffer_free(b); } }
+    } xfer_staging_pool;
     std::vector<server_slot> slots;
 
     int trace = 0;        // env: LLAMA_TRACE
@@ -1783,6 +1875,20 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
+
+            // pinned staging buffer for asynchronous state transfers (LLAMA_SERVER_XFER_STAGE_MB, default 64, 0 = off)
+            {
+                static const int stage_mb = getenv("LLAMA_SERVER_XFER_STAGE_MB") ? atoi(getenv("LLAMA_SERVER_XFER_STAGE_MB")) : 64;
+                ggml_backend_dev_t dev = stage_mb > 0 ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+                ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+                ggml_backend_buffer_t buf = buft ? ggml_backend_buft_alloc_buffer(buft, (size_t) stage_mb << 20) : nullptr;
+                if (buf) {
+                    xfer_staging_pool.bufs.push_back(buf);
+                    slot.xfer_staging      = ggml_backend_buffer_get_base(buf);
+                    slot.xfer_staging_size = (size_t) stage_mb << 20;
+                    SLT_INF(slot, "pinned staging buffer for state transfers: %d MiB\n", stage_mb);
+                }
+            }
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
 
@@ -2998,7 +3104,11 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // LLAMA_SERVER_CKPT_SYNC=1: context checkpoints are created / restored with a full context synchronize (the
+    // upstream behaviour) instead of the fence + worker-thread copy and the drain-free restore
+    const bool ckpt_sync = getenv("LLAMA_SERVER_CKPT_SYNC") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_SYNC")) != 0;
+
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool async = false) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -3052,8 +3162,12 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (async && ctx_dft == nullptr && slot.checkpoint_save_async(cur.n_tokens)) {
+            // the data arrives via xfer_poll(); the slot is held until then
+        } else {
+            cur.update_tgt(ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.seq_id, cur.data_spec);
 
@@ -3346,17 +3460,12 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
+                        // the saves are started one per update_slots() iteration (idle_saves_start): starting one costs
+                        // ~50-100 ms of metadata work per 160k tokens on this thread, so they must not stall the
+                        // decoders all at once
                         for (auto & slot : slots) {
-                            if (!slot.is_processing() && !slot.is_transferring()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-
-                                // asynchronous: the slot stays reserved until xfer_poll() reports completion
-                                // (with a unified KV cache it is cleared then - [TAG_IDLE_SLOT_CLEAR])
-                                if (slot.prompt_save_async(*prompt_cache, /*clear_after =*/ params_base.kv_unified)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                } else if (params_base.kv_unified) {
-                                    slot.prompt_clear();
-                                }
+                            if (!slot.is_processing() && !slot.is_transferring() && slot.prompt.tokens.size() > 0) {
+                                slot.want_idle_save = true;
                             }
                         }
                     }
@@ -4085,6 +4194,28 @@ private:
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
+            }
+        }
+
+        // start at most one pending idle-slot save per iteration (see SERVER_TASK_TYPE_COMPLETION launch)
+        if (params_base.cache_idle_slots && prompt_cache) {
+            for (auto & slot : slots) {
+                if (!slot.want_idle_save) {
+                    continue;
+                }
+                slot.want_idle_save = false;
+                if (slot.is_processing() || slot.is_transferring()) {
+                    continue;
+                }
+                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+                // asynchronous: the slot stays reserved until xfer_poll() reports completion
+                // (with a unified KV cache it is cleared then - [TAG_IDLE_SLOT_CLEAR])
+                if (slot.prompt_save_async(*prompt_cache, /*clear_after =*/ params_base.kv_unified)) {
+                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                } else if (params_base.kv_unified) {
+                    slot.prompt_clear();
+                }
+                break;
             }
         }
 
@@ -4955,7 +5086,11 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        if (!it->load_tgt(ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+                                        // checkpoints made by this process restore without draining the context
+                                        const bool ok_tgt = (ckpt_sync || it->id_task == -1)
+                                            ? it->load_tgt(ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+                                            : server_slot::checkpoint_load_nosync(ctx_tgt, it->data_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (!ok_tgt ||
                                             !it->load_dft(ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                                             if (it->id_task != -1) {
                                                 GGML_ABORT("failed to restore context checkpoint\n");
@@ -5229,8 +5364,39 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
+                    const bool prompt_done = slot.prompt.n_tokens() == slot.task->n_tokens();
+
+                    if (do_checkpoint && !ckpt_sync && ctx_dft == nullptr && !has_mtmd && n_tokens_cur > 0) {
+                        // asynchronous checkpoint: decide now (same rules as below), and if one is due, take this
+                        // slot's tokens back out of the batch - the checkpoint captures the state before them and
+                        // its copy runs on a worker thread behind a GPU fence while the other slots keep going;
+                        // the slot re-enters at the same position once xfer_poll() reports completion
+                        bool due = prompt_done || is_user_start || near_prompt_end;
+                        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.seq_id);
+                        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.seq_id);
+                        due = due && pos_min >= 0;
+                        due = due && (
+                                slot.prompt.checkpoints.empty() ||
+                                is_last_user_message || near_prompt_end ||
+                                n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                        due = due && slot.ckpt_async_n_tokens != n_tokens_start;
+                        if (due) {
+                            batch.truncate(n_tokens_prev);
+                            slot.prompt.tokens.keep_first(n_tokens_start);
+                            slot.ckpt_async_n_tokens = n_tokens_start;
+                            SLT_DBG(slot, "async checkpoint at n_tokens = %" PRId64 " (pos_min = %d, pos_max = %d), holding the slot for one round\n", (int64_t) n_tokens_start, pos_min, pos_max);
+                            create_checkpoint(slot, 0, pos_min, pos_max, /*async =*/ true);
+                            return;
+                        }
+                    }
+
+                    if (!ckpt_sync && ctx_dft == nullptr && !has_mtmd) {
+                        // asynchronous mode: the synchronous creation below (a full context drain) is never used
+                        do_checkpoint = false;
+                    }
+
                     // entire prompt has been processed
-                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                    if (prompt_done) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         slot.prefill_admitted = false;
