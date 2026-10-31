@@ -30,6 +30,8 @@
 #include <deque>
 #include <exception>
 #include <memory>
+#include <thread>
+#include <atomic>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -387,6 +389,167 @@ struct server_slot {
         }
 
         return res;
+    }
+
+    // asynchronous prompt-cache save / restore: the metadata is handled on the server thread, the 6+ GiB of KV tensor
+    // copies run on a worker thread via llama_state_seq_job_step() while the server keeps decoding the other slots.
+    // The slot is "transferring" until xfer_poll() reports completion: it must not be given a task (save) and its
+    // prompt must not be processed (restore) meanwhile - see get_available_slot(), pre_decode(), prefill_admit().
+    struct state_xfer {
+        bool is_save = false;
+        llama_state_seq_job * job_tgt = nullptr;
+        llama_state_seq_job * job_dft = nullptr;
+        server_prompt_cache_state * entry = nullptr; // save: the cache entry being filled
+        server_prompt_data data;                     // restore: the source bytes (kept alive until done)
+        bool clear_after = false;                    // save with a unified KV cache: clear the slot afterwards
+        std::thread th;
+        std::atomic<bool> done{false};
+
+        ~state_xfer() {
+            if (th.joinable()) {
+                th.join();
+            }
+            if (job_tgt) { llama_state_seq_job_free(job_tgt); }
+            if (job_dft) { llama_state_seq_job_free(job_dft); }
+        }
+    };
+    std::unique_ptr<state_xfer> xfer;
+
+    bool is_transferring() const { return xfer != nullptr; }
+
+    void xfer_start(std::unique_ptr<state_xfer> x) {
+        auto * raw = x.get();
+        xfer = std::move(x);
+        xfer->th = std::thread([raw]() {
+            for (auto * job : { raw->job_tgt, raw->job_dft }) {
+                if (job) {
+                    while (llama_state_seq_job_step(job, (size_t) 64 << 20) > 0) {
+                    }
+                }
+            }
+            raw->done.store(true);
+        });
+    }
+
+    // returns true if a save was started (the slot is busy until it completes); false if nothing to save (already
+    // cached, empty, no room) - in which case the caller may proceed as if the save had completed
+    bool prompt_save_async(server_prompt_cache & prompt_cache, bool clear_after) {
+        GGML_ASSERT(!is_transferring());
+
+        if (prompt.tokens.size() == 0) {
+            return false;
+        }
+
+        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        if (cur == nullptr) {
+            return false;
+        }
+
+        auto x = std::make_unique<state_xfer>();
+        x->is_save     = true;
+        x->entry       = cur;
+        x->clear_after = clear_after;
+
+        size_t n = 0;
+        x->job_tgt = llama_state_seq_get_data_begin(ctx_tgt, cur->data.main.data(), cur_size_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, &n);
+        if (!x->job_tgt || n != cur_size_tgt) {
+            SLT_WRN(*this, "%s", "asynchronous state save failed to start\n");
+            prompt_cache.erase(cur);
+            return false;
+        }
+        if (ctx_dft) {
+            x->job_dft = llama_state_seq_get_data_begin(ctx_dft, cur->data.drft.data(), cur_size_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, &n);
+            if (!x->job_dft || n != cur_size_dft) {
+                SLT_WRN(*this, "%s", "asynchronous draft state save failed to start\n");
+                prompt_cache.erase(cur);
+                return false;
+            }
+        }
+
+        cur->pending = true;
+
+        SLT_INF(*this, "saving prompt with length %d (%.1f MiB) to the cache asynchronously\n",
+                (int) prompt.tokens.size(), (cur_size_tgt + cur_size_dft) / (1024.0 * 1024.0));
+
+        xfer_start(std::move(x));
+
+        return true;
+    }
+
+    // returns true if a restore was started (the prompt metadata is in place, the KV copies run in the background;
+    // the slot's prompt must not be processed until xfer_poll() reports completion) or nothing better was cached
+    bool prompt_load_async(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        GGML_ASSERT(!is_transferring());
+
+        auto * best = prompt_cache.find_best(prompt, tokens);
+        if (best == nullptr) {
+            return true;
+        }
+
+        auto x = std::make_unique<state_xfer>();
+        x->is_save = false;
+        x->data    = std::move(best->data);
+
+        size_t n = 0;
+        x->job_tgt = llama_state_seq_set_data_begin(ctx_tgt, x->data.main.data(), x->data.main.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, &n);
+        if (!x->job_tgt || n != x->data.main.size()) {
+            SLT_WRN(*this, "%s", "asynchronous state restore failed to start\n");
+            prompt_cache.erase(best);
+            return false;
+        }
+        if (!x->data.drft.empty()) {
+            GGML_ASSERT(ctx_dft);
+            x->job_dft = llama_state_seq_set_data_begin(ctx_dft, x->data.drft.data(), x->data.drft.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE, &n);
+            if (!x->job_dft || n != x->data.drft.size()) {
+                SLT_WRN(*this, "%s", "asynchronous draft state restore failed to start\n");
+                prompt_cache.erase(best);
+                return false;
+            }
+        }
+
+        prompt = std::move(best->prompt);
+        prompt_cache.erase(best);
+
+        SLT_INF(*this, "restoring prompt with length %d (%.1f MiB) from the cache asynchronously\n",
+                (int) prompt.tokens.size(), x->data.size() / (1024.0 * 1024.0));
+
+        xfer_start(std::move(x));
+
+        return true;
+    }
+
+    // true when no transfer is in flight any more (finishes a completed one)
+    bool xfer_poll(server_prompt_cache * prompt_cache) {
+        if (!xfer) {
+            return true;
+        }
+        if (!xfer->done.load()) {
+            return false;
+        }
+
+        xfer->th.join();
+
+        if (xfer->is_save) {
+            if (xfer->entry) {
+                xfer->entry->pending = false;
+            }
+            if (prompt_cache) {
+                prompt_cache->update();
+            }
+            if (xfer->clear_after) {
+                prompt_clear();
+            }
+            SLT_INF(*this, "%s", "asynchronous state save done\n");
+        } else {
+            SLT_INF(*this, "%s", "asynchronous state restore done\n");
+        }
+
+        xfer.reset();
+
+        return true;
     }
 
     void prompt_clear() {
@@ -1923,8 +2086,8 @@ private:
                 }
 
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
-                    SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
+                if (slot.is_processing() || slot.is_transferring()) {
+                    SLT_TRC(slot, " - skipping, is_processing = %d, is_transferring = %d\n", slot.is_processing(), slot.is_transferring());
                     continue;
                 }
 
@@ -1995,9 +2158,18 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                if (ret->is_transferring()) {
+                    // a save or restore of this slot is still running: the task is deferred by the caller
+                    return nullptr;
+                }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (ret->prompt_save_async(*prompt_cache, /*clear_after =*/ false)) {
+                    // the slot's state is being copied out; the task is deferred until the copy completes, the other
+                    // slots keep decoding meanwhile (xfer_poll() re-queues deferred tasks)
+                    return nullptr;
+                }
+
+                if (!ret->prompt_load_async(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
@@ -2757,7 +2929,8 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            // a slot whose prompt-cache transfer is in flight is not available
+            if (!slot.is_processing() && !slot.is_transferring() && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
         }
@@ -3147,7 +3320,7 @@ private:
                         break;
                     }
 
-                    if (slot->is_processing()) {
+                    if (slot->is_processing() || slot->is_transferring()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
@@ -3174,16 +3347,14 @@ private:
 
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
+                            if (!slot.is_processing() && !slot.is_transferring()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                // asynchronous: the slot stays reserved until xfer_poll() reports completion
+                                // (with a unified KV cache it is cleared then - [TAG_IDLE_SLOT_CLEAR])
+                                if (slot.prompt_save_async(*prompt_cache, /*clear_after =*/ params_base.kv_unified)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
-                                }
-
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
+                                } else if (params_base.kv_unified) {
                                     slot.prompt_clear();
                                 }
                             }
@@ -3675,7 +3846,7 @@ private:
         GGML_ASSERT(src.is_processing() && !dst.is_processing());
 
         // realtime / audio-stream slots keep their sequence id in their own state
-        if (src.rt || src.audio_stream || dst.rt || dst.audio_stream) {
+        if (src.rt || src.audio_stream || dst.rt || dst.audio_stream || dst.is_transferring()) {
             return false;
         }
 
@@ -3783,6 +3954,10 @@ private:
 
             if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_STARTED) {
                 continue;
+            }
+
+            if (slot.is_transferring()) {
+                continue; // its KV state is still being restored
             }
 
             int32_t remaining = 0;
@@ -3910,6 +4085,13 @@ private:
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
+            }
+        }
+
+        // finish completed asynchronous prompt-cache transfers; a freed slot may unblock a deferred task
+        for (auto & slot : slots) {
+            if (slot.is_transferring() && slot.xfer_poll(prompt_cache.get())) {
+                queue_tasks.pop_deferred_task(slot.id);
             }
         }
 
@@ -4498,6 +4680,9 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    if (slot.is_transferring()) {
+                        return; // its KV state is still being restored from the prompt cache
+                    }
                     if (!slot.prefill_admitted) {
                         return; // waits for admission, see prefill_admit()
                     }

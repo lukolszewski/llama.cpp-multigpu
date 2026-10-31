@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include <string>
+#include <memory>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -708,9 +709,28 @@ struct server_prompt {
     }
 };
 
+// byte buffer without zero-fill: a 200k-token q8_0 state is ~6.5 GiB and std::vector::resize would spend seconds
+// zeroing it on the server thread; the pages are touched by the copy that fills it
+struct server_bytes {
+    std::unique_ptr<uint8_t[]> buf;
+    size_t n = 0;
+
+    void resize(size_t sz) {
+        buf.reset(sz ? new uint8_t[sz] : nullptr);
+        n = sz;
+    }
+    void clear() { buf.reset(); n = 0; }
+    void shrink_to_fit() {}
+
+          uint8_t * data()       { return buf.get(); }
+    const uint8_t * data() const { return buf.get(); }
+    size_t size()  const { return n; }
+    bool   empty() const { return n == 0; }
+};
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_bytes main;
+    server_bytes drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -720,6 +740,9 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+
+    // being filled by an asynchronous save (server_slot::prompt_save_async): not loadable, not evictable yet
+    bool pending = false;
 
     size_t size() const {
         size_t res = data.size();
@@ -753,6 +776,15 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // the entry load() would pick for tokens_new given the slot's current prompt (nullptr: none better); pending entries are skipped
+    server_prompt_cache_state * find_best(const server_prompt & prompt, const server_tokens & tokens_new);
+
+    // remove one entry (by address)
+    void erase(const server_prompt_cache_state * st);
+
+    // evict the oldest non-pending entry; false if there is none
+    bool evict_oldest();
 
     void update();
 };

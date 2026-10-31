@@ -953,6 +953,19 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Asynchronous sequence state transfer. The *_begin calls write / read the metadata now (host only, fast) and
+    // return a job holding the tensor copies, which llama_state_seq_job_step() executes - from any thread, while the
+    // context keeps decoding OTHER sequences. The sequence itself must not be modified until the job is done.
+    // n_bytes receives the state size (what the synchronous calls return). NULL on failure.
+    struct llama_state_seq_job;
+    LLAMA_API struct llama_state_seq_job * llama_state_seq_get_data_begin(
+            struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, size_t * n_bytes);
+    LLAMA_API struct llama_state_seq_job * llama_state_seq_set_data_begin(
+            struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags, size_t * n_bytes);
+    // execute up to max_bytes of the pending copies; returns the bytes still pending (0 = done)
+    LLAMA_API size_t llama_state_seq_job_step(struct llama_state_seq_job * job, size_t max_bytes);
+    LLAMA_API void   llama_state_seq_job_free(struct llama_state_seq_job * job);
+
     //
     // Decoding
     //

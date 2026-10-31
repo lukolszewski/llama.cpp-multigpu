@@ -3145,6 +3145,21 @@ llm_graph_cb llama_context::graph_get_cb() const {
 // state save/load
 //
 
+// asynchronous sequence state transfer (llama_state_seq_*_begin): the metadata is written / read synchronously, the
+// tensor copies are collected here and executed later by llama_state_seq_job_step()
+struct llama_state_seq_job {
+    struct copy {
+        ggml_tensor * tensor;
+        uint8_t     * ptr;     // host side
+        size_t        size;
+        size_t        offset;  // tensor side
+        bool          to_host; // true: tensor -> host (save), false: host -> tensor (restore)
+    };
+    std::vector<copy> copies;
+    size_t next    = 0;
+    size_t pending = 0;
+};
+
 class llama_io_write_dummy : public llama_io_write_i {
 public:
     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
@@ -3174,9 +3189,16 @@ private:
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len, std::vector<llama_state_seq_job::copy> * deferred = nullptr) : ptr(p), base_ptr(p), buf_size(len), deferred(deferred) {}
 
     ~llama_io_write_host() {
+        if (deferred) {
+            // asynchronous transfer: hand the copies to the job instead of executing them
+            for (const auto & winfo : winfos) {
+                deferred->push_back({ winfo.tensor, base_ptr + winfo.data_offset, winfo.size, winfo.offset, /*to_host =*/ true });
+            }
+            return;
+        }
         if (winfos.empty()) {
             return;
         }
@@ -3241,13 +3263,22 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    std::vector<llama_state_seq_job::copy> * deferred = nullptr;
 };
 
 class llama_io_read_host : public llama_io_read_i {
 public:
-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
+    llama_io_read_host(const uint8_t * p, size_t len, std::vector<llama_state_seq_job::copy> * deferred = nullptr) : ptr(p), base_ptr(p), buf_size(len), deferred(deferred) {}
 
     ~llama_io_read_host() {
+        if (deferred) {
+            // asynchronous transfer: hand the copies to the job instead of executing them
+            for (const auto & rinfo : rinfos) {
+                deferred->push_back({ rinfo.tensor, const_cast<uint8_t *>(base_ptr + rinfo.data_offset), rinfo.size, rinfo.offset, /*to_host =*/ false });
+            }
+            return;
+        }
         if (rinfos.empty()) {
             return;
         }
@@ -3315,6 +3346,8 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+
+    std::vector<llama_state_seq_job::copy> * deferred = nullptr;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -3965,6 +3998,69 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     }
 
     return io.n_bytes();
+}
+
+llama_state_seq_job * llama_context::state_seq_get_data_begin(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, size_t * n_bytes) {
+    auto * job = new llama_state_seq_job();
+
+    try {
+        size_t n = 0;
+        {
+            llama_io_write_host io(dst, size, &job->copies);
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&seq_id, sizeof(seq_id));
+            n = state_seq_write_data(io, seq_id, flags);
+        }
+        for (const auto & c : job->copies) {
+            job->pending += c.size;
+        }
+        if (n_bytes) {
+            *n_bytes = n;
+        }
+        return job;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        delete job;
+        return nullptr;
+    }
+}
+
+llama_state_seq_job * llama_context::state_seq_set_data_begin(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, size_t * n_bytes) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        LLAMA_LOG_ERROR("%s: on-device states cannot be restored asynchronously\n", __func__);
+        return nullptr;
+    }
+
+    auto * job = new llama_state_seq_job();
+
+    try {
+        size_t n = 0;
+        {
+            llama_io_read_host io(src, size, &job->copies);
+
+            uint32_t magic_read;
+            io.read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            io.read(&seq_id_read, sizeof(seq_id_read));
+
+            n = state_seq_read_data(io, seq_id, flags);
+        }
+        for (const auto & c : job->copies) {
+            job->pending += c.size;
+        }
+        if (n_bytes) {
+            *n_bytes = n;
+        }
+        return job;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        delete job;
+        return nullptr;
+    }
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -4904,6 +5000,33 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+llama_state_seq_job * llama_state_seq_get_data_begin(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, size_t * n_bytes) {
+    return ctx->state_seq_get_data_begin(seq_id, dst, size, flags, n_bytes);
+}
+
+llama_state_seq_job * llama_state_seq_set_data_begin(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, size_t * n_bytes) {
+    return ctx->state_seq_set_data_begin(seq_id, src, size, flags, n_bytes);
+}
+
+size_t llama_state_seq_job_step(llama_state_seq_job * job, size_t max_bytes) {
+    size_t done = 0;
+    while (job->next < job->copies.size() && done < max_bytes) {
+        const auto & c = job->copies[job->next++];
+        if (c.to_host) {
+            ggml_backend_tensor_get(c.tensor, c.ptr, c.offset, c.size);
+        } else {
+            ggml_backend_tensor_set(c.tensor, c.ptr, c.offset, c.size);
+        }
+        done += c.size;
+        job->pending -= c.size;
+    }
+    return job->pending;
+}
+
+void llama_state_seq_job_free(llama_state_seq_job * job) {
+    delete job;
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

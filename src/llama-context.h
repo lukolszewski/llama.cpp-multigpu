@@ -172,6 +172,10 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    // asynchronous variants: metadata now, tensor copies in the returned job (see llama.h)
+    struct llama_state_seq_job * state_seq_get_data_begin(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags, size_t * n_bytes);
+    struct llama_state_seq_job * state_seq_set_data_begin(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, size_t * n_bytes);
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,

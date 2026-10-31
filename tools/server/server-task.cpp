@@ -1811,7 +1811,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && !it->pending) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1826,12 +1826,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            if (!evict_oldest()) {
+                break; // only pending entries left
+            }
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    server_bytes state_data_tgt;
+    server_bytes state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
@@ -1863,6 +1865,59 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt & prompt, const server_tokens & tokens_new) {
+    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_sim_best  = float(lcp_best) / tokens_new.size();
+
+    server_prompt_cache_state * best = nullptr;
+
+    for (auto & st : states) {
+        if (st.pending) {
+            continue;
+        }
+
+        const int lcp_cur = st.prompt.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep_cur = float(lcp_cur) / st.prompt.tokens.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        // don't trash large prompts
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            f_keep_best = f_keep_cur;
+            f_sim_best  = f_sim_cur;
+
+            best = &st;
+        }
+    }
+
+    return best;
+}
+
+void server_prompt_cache::erase(const server_prompt_cache_state * st) {
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (&*it == st) {
+            states.erase(it);
+            return;
+        }
+    }
+}
+
+bool server_prompt_cache::evict_oldest() {
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (!it->pending) {
+            states.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
@@ -1875,6 +1930,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->pending) {
+            continue;
+        }
+
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1945,7 +2004,9 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            if (!evict_oldest()) {
+                break;
+            }
         }
     }
 
@@ -1960,7 +2021,9 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            if (!evict_oldest()) {
+                break;
+            }
         }
     }
 
