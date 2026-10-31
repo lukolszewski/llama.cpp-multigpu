@@ -409,6 +409,7 @@ struct server_slot {
         llama_fence * fence = nullptr;               // wait for the GPU work that produced the state first
         void * staging = nullptr;                    // pinned staging buffer (optional)
         size_t staging_size = 0;
+        std::function<void()> on_done;               // wakes the server loop (it may be asleep with every slot transferring)
         std::thread th;
         std::atomic<bool> done{false};
 
@@ -423,6 +424,7 @@ struct server_slot {
     };
     std::unique_ptr<state_xfer> xfer;
 
+    std::function<void()> xfer_wakeup;  // posts a NEXT_RESPONSE task so that update_slots() polls the finished transfer
     void * xfer_staging      = nullptr; // pinned staging buffer for the transfer worker (owned by server_context)
     size_t xfer_staging_size = 0;
     bool   want_idle_save    = false;   // idle slot to be saved to the prompt cache (started one per update_slots)
@@ -433,6 +435,7 @@ struct server_slot {
         auto * raw = x.get();
         raw->staging      = xfer_staging;
         raw->staging_size = xfer_staging_size;
+        raw->on_done      = xfer_wakeup;
         xfer = std::move(x);
         xfer->th = std::thread([raw]() {
             if (raw->fence) {
@@ -445,6 +448,10 @@ struct server_slot {
                 }
             }
             raw->done.store(true);
+            // the loop sleeps when no slot is processing (deferred tasks included): wake it so that xfer_poll() runs
+            if (raw->on_done) {
+                raw->on_done();
+            }
         });
     }
 
@@ -1875,6 +1882,12 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
+
+            slot.xfer_wakeup = [this]() {
+                server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                task.id = queue_tasks.get_new_id();
+                queue_tasks.post(std::move(task));
+            };
 
             // pinned staging buffer for asynchronous state transfers (LLAMA_SERVER_XFER_STAGE_MB, default 64, 0 = off)
             {
@@ -4169,6 +4182,37 @@ private:
         }
 #endif
 
+        // start at most one pending idle-slot save per iteration (see SERVER_TASK_TYPE_COMPLETION launch)
+        if (params_base.cache_idle_slots && prompt_cache) {
+            for (auto & slot : slots) {
+                if (!slot.want_idle_save) {
+                    continue;
+                }
+                slot.want_idle_save = false;
+                if (slot.is_processing() || slot.is_transferring()) {
+                    continue;
+                }
+                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+                // asynchronous: the slot stays reserved until xfer_poll() reports completion
+                // (with a unified KV cache it is cleared then - [TAG_IDLE_SLOT_CLEAR])
+                if (slot.prompt_save_async(*prompt_cache, /*clear_after =*/ params_base.kv_unified)) {
+                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                } else if (params_base.kv_unified) {
+                    slot.prompt_clear();
+                }
+                break;
+            }
+        }
+
+        // finish completed asynchronous prompt-cache transfers; a freed slot may unblock a deferred task.
+        // Must run before the all-idle return below: with every slot transferring nothing is processing, and the
+        // worker's NEXT_RESPONSE wake-up only gets the loop here
+        for (auto & slot : slots) {
+            if (slot.is_transferring() && slot.xfer_poll(prompt_cache.get())) {
+                queue_tasks.pop_deferred_task(slot.id);
+            }
+        }
+
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
         {
@@ -4194,35 +4238,6 @@ private:
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
-            }
-        }
-
-        // start at most one pending idle-slot save per iteration (see SERVER_TASK_TYPE_COMPLETION launch)
-        if (params_base.cache_idle_slots && prompt_cache) {
-            for (auto & slot : slots) {
-                if (!slot.want_idle_save) {
-                    continue;
-                }
-                slot.want_idle_save = false;
-                if (slot.is_processing() || slot.is_transferring()) {
-                    continue;
-                }
-                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-                // asynchronous: the slot stays reserved until xfer_poll() reports completion
-                // (with a unified KV cache it is cleared then - [TAG_IDLE_SLOT_CLEAR])
-                if (slot.prompt_save_async(*prompt_cache, /*clear_after =*/ params_base.kv_unified)) {
-                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                } else if (params_base.kv_unified) {
-                    slot.prompt_clear();
-                }
-                break;
-            }
-        }
-
-        // finish completed asynchronous prompt-cache transfers; a freed slot may unblock a deferred task
-        for (auto & slot : slots) {
-            if (slot.is_transferring() && slot.xfer_poll(prompt_cache.get())) {
-                queue_tasks.pop_deferred_task(slot.id);
             }
         }
 
