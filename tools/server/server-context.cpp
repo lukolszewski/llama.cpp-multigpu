@@ -3881,7 +3881,31 @@ private:
         }
 
         if (n_groups > 1) {
-            cur_group = (cur_group + 1) % n_groups;
+            // next group that has work (a parked batch or a processing slot); empty groups cost nothing
+            int n_processing = 0;
+            for (const auto & slot : slots) {
+                n_processing += slot.is_processing() ? 1 : 0;
+            }
+            auto group_has_work = [&](int g) {
+                if (pending[g].active) {
+                    return true;
+                }
+                for (const auto & slot : slots) {
+                    if (slot.group == g && slot.is_processing()) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            for (int k = 0; k < n_groups; ++k) {
+                cur_group = (cur_group + 1) % n_groups;
+                if (group_has_work(cur_group)) {
+                    break;
+                }
+            }
+            // a single active user gains nothing from the stream-agnostic graph (it costs ~5 % solo): use the
+            // per-stream class while only one slot is processing; the switch costs one graph rebuild
+            setenv("LLAMA_DECODE_PIPELINE", n_processing >= 2 ? "2" : "1", 1);
             auto & pb = pending[cur_group];
             if (pb.active) {
                 // results of this group's previous batch: sample them now (waits only for that batch)
