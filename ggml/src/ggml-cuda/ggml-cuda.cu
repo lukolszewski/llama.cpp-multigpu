@@ -5022,7 +5022,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
             graph->warmup_complete = true;
             use_cuda_graph = true;
-            cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+            cuda_graph_update_required = properties_changed || graph->instances.empty();
         } else if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 

@@ -2068,7 +2068,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (log_realloc) {
                 n_realloc++;
                 GGML_LOG_WARN("%s: graph reallocation #%d (backend_ids_changed = %d, graph size = %d, nodes = %d, leafs = %d)\n", __func__,
-                        n_realloc, backend_ids_changed, sched->debug_graph_size, sched->graph.n_nodes, sched->graph.n_leafs);
+                        n_realloc, backend_ids_changed, sched->graph_size, sched->graph.n_nodes, sched->graph.n_leafs);
             }
         }
 
