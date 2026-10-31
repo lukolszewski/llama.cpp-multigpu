@@ -1126,16 +1126,15 @@ private:
     };
     std::vector<pending_batch> pending;
     // group mode only: while any other slot is generating, prompt tokens are issued in batches of at most
-    // prefill_chunk_with_decode tokens (default 0 = off; LLAMA_SERVER_PREFILL_CHUNK=256 with GGML_SCHED_REPLAN_NOSYNC=1) by at most
+    // prefill_chunk_with_decode tokens (default 256; LLAMA_SERVER_PREFILL_CHUNK, 0 disables) by at most
     // prefill_max_with_decode slots (default 1; LLAMA_SERVER_PREFILL_MAX_WITH_DECODE, 0 = no override), so the
     // decoders' 1-token batches queue behind one ubatch per card instead of a whole n_batch
     int32_t prefill_chunk_with_decode = -1;
     int32_t prefill_max_with_decode   = 1;
     // issue one prefill chunk per update_slots() call in addition to the rotating group's batch, so the chunks
     // pipeline back to back while the decoders' tokens interleave (LLAMA_SERVER_PREFILL_EAGER=1 enables).
-    // OFF by default: with CUDA graphs and the non-draining scheduler re-plan it corrupts the decoders' output after a
-    // few hundred tokens (fine with direct kernel launches, GGML_CUDA_GRAPHS_FORCE=0); the ggml-cuda side is not
-    // understood yet - see airun/plan-prefill-and-cache.md A.
+    // OFF by default: correct since the scheduler covers the output read-outs with its events, but on this machine it
+    // trades latency for prefill throughput (c5: 538 ms gaps / 132 s vs 281 ms / 141 s without) - a knob, not a default.
     bool    prefill_eager             = false;
     bool    prefill_chunked           = false; // state of the last pre_decode(), for logging
 
@@ -1593,10 +1592,11 @@ private:
                 // 256 by default: the decoders' tokens trail one chunk per card, so the chunk's per-card time bounds their
                 // latency, while the host cost per chunk (~70 ms, mostly CUDA-graph capture) bounds the prefill rate;
                 // measured 2 × 12k decoders + 39k prefill: 256 → 420 ms gaps / 1.7k t/s, 512 → 700 ms / 2.0k, p2 → 1.3 s / 1.4k
-                // OFF by default (0 = whole n_batch, the validated behaviour): chunking only pays with the scheduler's
-                // experimental non-draining re-plan (GGML_SCHED_REPLAN_NOSYNC=1), which is not yet correct at depth; with
-                // the drain every chunk costs a pipeline drain and makes things worse (c5: 1.5 t/s / 660 t/s vs 3.0 / 1.0k)
-                prefill_chunk_with_decode = 0;
+                // 256 by default (0 = whole n_batch): the decoders' tokens trail one chunk per card, so the chunk's per-card
+                // time bounds their latency; c5 (2 x 58k decoders during a 200k prefill): median gap 1318 -> 281 ms, whole
+                // run 262 -> 141 s. Needs the scheduler's non-draining re-plan (default); with GGML_SCHED_REPLAN_SYNC=1 every
+                // chunk costs a pipeline drain and chunking makes things worse - set LLAMA_SERVER_PREFILL_CHUNK=0 then.
+                prefill_chunk_with_decode = std::min<int32_t>(256, (int32_t) llama_n_ubatch(ctx_tgt));
                 if (const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK")) {
                     prefill_chunk_with_decode = atoi(e);
                 }
