@@ -48,8 +48,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
 }
 
 bool llm_graph_decode_pipeline() {
-    static const bool enabled = getenv("LLAMA_DECODE_PIPELINE") != nullptr && atoi(getenv("LLAMA_DECODE_PIPELINE")) != 0;
-    return enabled;
+    // read live (not static): the server raises the level after the warmup decode
+    const char * env = getenv("LLAMA_DECODE_PIPELINE");
+    return env != nullptr && atoi(env) != 0;
 }
 
 static bool can_reuse_kq_mask(

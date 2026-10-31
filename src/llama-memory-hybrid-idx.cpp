@@ -111,7 +111,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 // LLAMA_DECODE_PIPELINE=2: also single-sequence decode batches take the pipelined (stream-agnostic) class,
                 // with n_kv floored to the deepest active sequence, so that consecutive decode batches of different
                 // sequences (the server's pipelined groups) share one graph
-                static const int decode_pipeline = getenv("LLAMA_DECODE_PIPELINE") != nullptr ? atoi(getenv("LLAMA_DECODE_PIPELINE")) : 0;
+                // read live (not static): the server raises the level after the warmup decode
+                const int decode_pipeline = getenv("LLAMA_DECODE_PIPELINE") != nullptr ? atoi(getenv("LLAMA_DECODE_PIPELINE")) : 0;
                 if (decode_pipeline > 0 && !unified && ubatches.empty() && (ubatch.n_tokens > 1 || decode_pipeline >= 2) && ubatch.n_seq_tokens == 1 &&
                         ubatch.n_seqs > 1 && ubatch.n_tokens == balloc.get_n_tokens()) {
                     balloc.split_reset();
@@ -155,7 +156,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         // per-sequence decode ubatches (LLAMA_DECODE_PIPELINE): give them all the batch's largest n_kv so that
         // they build identical graph shapes and the graph is reused across streams
         uint32_t n_kv_min = 0;
-        static const int decode_pipeline_lvl = getenv("LLAMA_DECODE_PIPELINE") != nullptr ? atoi(getenv("LLAMA_DECODE_PIPELINE")) : 0;
+        const int decode_pipeline_lvl = getenv("LLAMA_DECODE_PIPELINE") != nullptr ? atoi(getenv("LLAMA_DECODE_PIPELINE")) : 0;
         if (ubatches.size() > 1 || (decode_pipeline_lvl >= 2 && ubatches.size() == 1 && !embd_all)) {
             bool pure_decode = true;
             for (const auto & ub : ubatches) {
