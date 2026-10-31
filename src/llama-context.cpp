@@ -4610,43 +4610,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->output_synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
