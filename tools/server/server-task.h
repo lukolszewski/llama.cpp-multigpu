@@ -8,6 +8,10 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -711,21 +715,69 @@ struct server_prompt {
 
 // byte buffer without zero-fill: a 200k-token q8_0 state is ~6.5 GiB and std::vector::resize would spend seconds
 // zeroing it on the server thread; the pages are touched by the copy that fills it
+//
+// release: the pages are returned with madvise(MADV_DONTNEED) in 64 MiB pieces before the mapping is freed. A single
+// munmap of a touched multi-GiB buffer holds the process's mmap lock exclusively for 100-200 ms, which stalls every
+// mmap() of the other threads (e.g. the server thread allocating the next cache entry - "resize" in the save log line);
+// DONTNEED takes the lock shared and the pieces keep each hold short
 struct server_bytes {
-    std::unique_ptr<uint8_t[]> buf;
+    uint8_t * buf = nullptr;
     size_t n = 0;
 
+    server_bytes() = default;
+    server_bytes(const server_bytes &) = delete;
+    server_bytes & operator=(const server_bytes &) = delete;
+    server_bytes(server_bytes && o) noexcept : buf(o.buf), n(o.n) { o.buf = nullptr; o.n = 0; }
+    server_bytes & operator=(server_bytes && o) noexcept {
+        if (this != &o) {
+            clear();
+            buf = o.buf; n = o.n;
+            o.buf = nullptr; o.n = 0;
+        }
+        return *this;
+    }
+    ~server_bytes() { clear(); }
+
     void resize(size_t sz) {
-        buf.reset(sz ? new uint8_t[sz] : nullptr);
+        clear();
+        buf = sz ? new uint8_t[sz] : nullptr;
         n = sz;
     }
-    void clear() { buf.reset(); n = 0; }
+    void clear();
     void shrink_to_fit() {}
 
-          uint8_t * data()       { return buf.get(); }
-    const uint8_t * data() const { return buf.get(); }
+          uint8_t * data()       { return buf; }
+    const uint8_t * data() const { return buf; }
     size_t size()  const { return n; }
     bool   empty() const { return n == 0; }
+};
+
+// frees large host buffers on a background thread: releasing a touched multi-GiB prompt-cache entry (munmap of hundreds
+// of thousands of pages) costs 50-200 ms, which used to land on the server thread at every save start / restore end
+struct server_reaper {
+    static server_reaper & instance();
+
+    template<typename T>
+    void discard(T && obj) {
+        using U = typename std::decay<T>::type;
+        std::shared_ptr<void> holder = std::make_shared<U>(std::move(obj));
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            trash.push_back(std::move(holder));
+        }
+        cv.notify_one();
+    }
+
+    ~server_reaper();
+
+private:
+    server_reaper();
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<std::shared_ptr<void>> trash;
+    bool stop = false;
+    std::thread th;
 };
 
 struct server_prompt_data {
@@ -782,6 +834,14 @@ struct server_prompt_cache {
 
     // remove one entry (by address)
     void erase(const server_prompt_cache_state * st);
+
+    // remove an entry, handing its buffers to the reaper thread
+    std::list<server_prompt_cache_state>::iterator erase_it(std::list<server_prompt_cache_state>::iterator it);
+
+    // timing of the last alloc() (ms), reported by the slot's save log line
+    double t_alloc_erase_ms  = 0; // removing obsolete / evicted entries
+    double t_alloc_resize_ms = 0; // allocating the new buffers
+    double t_alloc_copy_ms   = 0; // cloning the prompt tokens + checkpoints
 
     // evict the oldest non-pending entry; false if there is none
     bool evict_oldest();

@@ -1,5 +1,9 @@
 #include "server-task.h"
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
 #include "build-info.h"
 #include "server-chat.h"
 #include "chat.h"
@@ -1759,6 +1763,64 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// server_bytes
+//
+void server_bytes::clear() {
+    if (buf) {
+#ifdef __linux__
+        if (n >= (size_t) 64 << 20) {
+            const size_t page  = 4096;
+            const size_t piece = (size_t) 64 << 20;
+            uintptr_t beg = ((uintptr_t) buf + page - 1) & ~(uintptr_t) (page - 1);
+            uintptr_t end = ((uintptr_t) buf + n) & ~(uintptr_t) (page - 1);
+            for (uintptr_t p = beg; p < end; p += piece) {
+                madvise((void *) p, std::min<size_t>(piece, end - p), MADV_DONTNEED);
+            }
+        }
+#endif
+        delete[] buf;
+    }
+    buf = nullptr;
+    n   = 0;
+}
+
+//
+// server_reaper
+//
+server_reaper & server_reaper::instance() {
+    static server_reaper inst;
+    return inst;
+}
+
+server_reaper::server_reaper() {
+    th = std::thread([this]() {
+        std::vector<std::shared_ptr<void>> batch;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [this]() { return stop || !trash.empty(); });
+                if (stop && trash.empty()) {
+                    return;
+                }
+                batch.swap(trash);
+            }
+            batch.clear(); // the buffers are freed here, off the server thread
+        }
+    });
+}
+
+server_reaper::~server_reaper() {
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stop = true;
+    }
+    cv.notify_all();
+    if (th.joinable()) {
+        th.join();
+    }
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {
@@ -1807,6 +1869,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    const int64_t t_erase0 = ggml_time_us();
+
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1814,7 +1878,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size() && !it->pending) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            it = states.erase(it);
+            it = erase_it(it);
         } else {
             ++it;
         }
@@ -1831,6 +1895,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             }
         }
     }
+
+    const int64_t t_resize0 = ggml_time_us();
+    t_alloc_erase_ms = (t_resize0 - t_erase0) / 1000.0;
 
     server_bytes state_data_tgt;
     server_bytes state_data_dft;
@@ -1851,6 +1918,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    const int64_t t_copy0 = ggml_time_us();
+    t_alloc_resize_ms = (t_copy0 - t_resize0) / 1000.0;
+
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
@@ -1861,6 +1931,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
     });
+
+    t_alloc_copy_ms = (ggml_time_us() - t_copy0) / 1000.0;
 
     return &states.back();
 }
@@ -1899,10 +1971,17 @@ server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt &
     return best;
 }
 
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase_it(std::list<server_prompt_cache_state>::iterator it) {
+    auto & reaper = server_reaper::instance();
+    reaper.discard(std::move(it->data));
+    reaper.discard(std::move(it->prompt.checkpoints));
+    return states.erase(it);
+}
+
 void server_prompt_cache::erase(const server_prompt_cache_state * st) {
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (&*it == st) {
-            states.erase(it);
+            erase_it(it);
             return;
         }
     }
@@ -1911,7 +1990,7 @@ void server_prompt_cache::erase(const server_prompt_cache_state * st) {
 bool server_prompt_cache::evict_oldest() {
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (!it->pending) {
-            states.erase(it);
+            erase_it(it);
             return true;
         }
     }
@@ -1968,8 +2047,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            server_reaper::instance().discard(std::move(data));
         }
 
         {
@@ -1986,14 +2064,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                server_reaper::instance().discard(std::move(data));
             }
         }
 
         prompt = std::move(it_best->prompt);
 
-        states.erase(it_best);
+        erase_it(it_best);
     }
 
     return true;

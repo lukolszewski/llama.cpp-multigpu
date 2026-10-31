@@ -443,7 +443,7 @@ struct server_slot {
             }
             for (auto * job : { raw->job_tgt, raw->job_dft }) {
                 if (job) {
-                    while (llama_state_seq_job_step_staged(job, (size_t) 64 << 20, raw->staging, raw->staging_size) > 0) {
+                    while (llama_state_seq_job_step_staged(job, (size_t) 1 << 30, raw->staging, raw->staging_size) > 0) {
                     }
                 }
             }
@@ -501,9 +501,17 @@ struct server_slot {
 
         cur->pending = true;
 
-        SLT_INF(*this, "saving prompt with length %d (%.1f MiB) to the cache asynchronously (start: size %.1f ms, alloc %.1f ms, meta %.1f ms)\n",
+        size_t ckpt_bytes = 0;
+        for (const auto & c : prompt.checkpoints) {
+            ckpt_bytes += c.size();
+        }
+
+        SLT_INF(*this, "saving prompt with length %d (%.1f MiB + %zu checkpoints %.1f MiB) to the cache asynchronously (start: size %.1f ms, alloc %.1f ms [erase %.1f, resize %.1f, copy %.1f], meta %.1f ms)\n",
                 (int) prompt.tokens.size(), (cur_size_tgt + cur_size_dft) / (1024.0 * 1024.0),
-                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (ggml_time_us() - t2) / 1000.0);
+                prompt.checkpoints.size(), ckpt_bytes / (1024.0 * 1024.0),
+                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0,
+                prompt_cache.t_alloc_erase_ms, prompt_cache.t_alloc_resize_ms, prompt_cache.t_alloc_copy_ms,
+                (ggml_time_us() - t2) / 1000.0);
 
         xfer_start(std::move(x));
 
@@ -544,7 +552,7 @@ struct server_slot {
 
     // restore a context checkpoint without draining the context: the sequence has no work in flight (its last
     // outputs were consumed before the slot was released), the other sequences' work touches other state rows
-    static bool checkpoint_load_nosync(llama_context * ctx, const std::vector<uint8_t> & data, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    static bool checkpoint_load_nosync(llama_context * ctx, const common_shared_bytes & data, llama_seq_id seq_id, llama_state_seq_flags flags) {
         if (ctx == nullptr || data.empty()) {
             return true;
         }
@@ -637,6 +645,8 @@ struct server_slot {
             }
             SLT_INF(*this, "%s", "asynchronous state save done\n");
         } else {
+            // the source bytes (up to several GiB) are released off the server thread
+            server_reaper::instance().discard(std::move(xfer->data));
             SLT_INF(*this, "%s", "asynchronous state restore done\n");
         }
 
@@ -650,6 +660,7 @@ struct server_slot {
 
         mem.seq_rm(seq_id, -1, -1);
 
+        server_reaper::instance().discard(std::move(prompt.checkpoints));
         prompt.clear();
     }
 
@@ -3145,6 +3156,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                server_reaper::instance().discard(std::move(*it));
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -3160,6 +3172,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            server_reaper::instance().discard(std::move(slot.prompt.checkpoints.front()));
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -3169,6 +3182,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    server_reaper::instance().discard(std::move(*it));
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -5150,6 +5164,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        server_reaper::instance().discard(std::move(*it));
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;

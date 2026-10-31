@@ -1292,6 +1292,26 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// reference-counted byte buffer: a hybrid model's context checkpoint is ~100 MiB, and copies of a checkpoint (e.g. the
+// server's prompt cache keeping a slot's checkpoints) share the bytes instead of duplicating them. The bytes are
+// treated as immutable once filled: resize() allocates a fresh buffer, clear() only drops this reference.
+struct common_shared_bytes {
+    std::shared_ptr<std::vector<uint8_t>> ptr;
+
+    size_t size()  const { return ptr ? ptr->size() : 0; }
+    bool   empty() const { return size() == 0; }
+    void   clear()       { ptr.reset(); }
+    void   resize(size_t n) { ptr = std::make_shared<std::vector<uint8_t>>(n); }
+
+          uint8_t * data()       { return ptr ? ptr->data() : nullptr; }
+    const uint8_t * data() const { return ptr ? ptr->data() : nullptr; }
+
+    common_shared_bytes & operator=(std::vector<uint8_t> && v) {
+        ptr = std::make_shared<std::vector<uint8_t>>(std::move(v));
+        return *this;
+    }
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1301,8 +1321,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_shared_bytes data_tgt;
+    common_shared_bytes data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

@@ -2101,6 +2101,13 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
         uint32_t cell_count = 0;
 
+        // a sequence lives in exactly one stream: do not scan the other streams' cells (262k each) for it - the scan
+        // runs twice per state save (size + data) on the server thread
+        if (seq_id != -1 && n_stream > 1 && seq_to_stream[seq_id] != s) {
+            io.write(&cell_count, sizeof(cell_count));
+            continue;
+        }
+
         const auto & cells = v_cells[s];
 
         // Count the number of cells with the specified seq_id
