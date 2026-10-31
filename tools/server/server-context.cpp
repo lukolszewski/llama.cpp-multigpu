@@ -2204,9 +2204,10 @@ private:
                     continue;
                 }
 
-                // skip the slot if it is not available
-                if (slot.is_processing() || slot.is_transferring()) {
-                    SLT_TRC(slot, " - skipping, is_processing = %d, is_transferring = %d\n", slot.is_processing(), slot.is_transferring());
+                // skip the slot if it is not available (a transferring slot still takes part: if it is the best match
+                // the task waits for its save to finish instead of re-prefilling the prompt in another slot)
+                if (slot.is_processing()) {
+                    SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
                     continue;
                 }
 
@@ -2230,6 +2231,11 @@ private:
 
                     ret = &slot;
                 }
+            }
+
+            if (ret != nullptr && ret->is_transferring()) {
+                SLT_INF(*ret, "best slot by LCP similarity (f_sim = %.3f) is still being saved: the task waits for it\n", f_sim_best);
+                return nullptr; // deferred by the caller, re-queued when the transfer completes
             }
 
             if (ret != nullptr) {
@@ -2258,6 +2264,10 @@ private:
 
                 update_cache = true;
             }
+        }
+
+        if (ret && ret->is_transferring()) {
+            return nullptr; // requested by id while its state is in flight: deferred
         }
 
         if (ret) {
