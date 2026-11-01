@@ -539,7 +539,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();
         const auto * idx = mem->get_mem_idx();
-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_stream();  // get_size() is per stream
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
         st.n_pool_graph = st.n_pool_real;
@@ -564,7 +564,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();
         const auto * idx = mem->get_mem_idx();
-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_stream();  // get_size() is per stream
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
         st.n_pool_graph = st.n_pool_real;
@@ -845,7 +845,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
 
     // a ubatch touches at most t_s/kpool + 1 pools per sequence, pad to that bound so the graph keeps its shape
     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
-    const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
+    const uint32_t n_pool_max = kv_size / kpool * idx->get_n_stream();  // kv_size is per stream (unified: the whole pool)
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_graph) - 1, n_pool_max})});
 }
