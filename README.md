@@ -41,6 +41,14 @@ Full 20-row table and protocol: [§1](#1-performance-summary) · binaries and im
 [§5](#5-usage) · what the 47 patches do: [docs/multigpu/patches.md](docs/multigpu/patches.md) · where it does **not**
 help (other models, NVLink or single-GPU boxes, mixed prefill + decode): [§9](#9-known-limitations).
 
+> **GLM-5.3-Flash?** It has its own branch: [`glm-multigpu`](../../tree/glm-multigpu). That branch is this patchset
+> (pipeline-parallel prefill, per-sequence decode groups, prefill admission) ported onto a newer upstream that supports
+> the `glm5-next` architecture, plus GLM-specific fixes: per-sequence k-pool scoring and a compact q8_0 gather for the
+> sparse (DSA) attention layers. Measured 2026-11-01 with `UD-IQ4_XS`, every expert in VRAM on 6 × RTX 3090 +
+> RTX 5060 Ti, `q8_0` KV: one session up to 273k context at 33.8 t/s generation (25.8 t/s at 230k) and ~1000 t/s
+> prefill; five concurrent sessions × 44k. No prebuilt releases for it yet; build from source (`86;120` for Ampere +
+> Blackwell).
+
 **STATUS: TEMPORARY DOWNSTREAM PERFORMANCE FORK.** This repository exists only while these workloads perform
 materially better here than in upstream [`llama.cpp`](https://github.com/ggml-org/llama.cpp). The intended
 end state is that upstream implements equivalent or better fixes and this repository is archived — **archiving
@@ -54,6 +62,7 @@ format, or ecosystem.
 | --- | --- |
 | Upstream | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — MIT licensed, remains the general-purpose project |
 | Patched branch | [`multigpu`](../../tree/multigpu) (this page) — upstream + the performance patchset, and the source of all releases |
+| GLM-5.3-Flash branch | [`glm-multigpu`](../../tree/glm-multigpu) — the patchset ported to a newer upstream with `glm5-next` support, plus GLM-specific fixes; source only, no releases |
 | Upstream-tracking branch | [`master`](../../tree/master) — kept as close to upstream as practical, never released from |
 | Prebuilt binaries | [Releases](../../releases) — two Linux x86-64 CUDA builds per release (CUDA 12.9: V100 → RTX 5090; CUDA 13.4: Ampere+) plus `ghcr.io/lukolszewski/llama.cpp-multigpu` images; see [Downloads](#4-downloads) |
 | Benchmarks | Measured 2026-10-05 on machine-01 (6 × RTX 3090): prefill 1.75–8×, decode 1.2–10.8× vs upstream — [Performance summary](#1-performance-summary); protocol and raw data in [docs/multigpu/benchmarks.md](docs/multigpu/benchmarks.md) |
