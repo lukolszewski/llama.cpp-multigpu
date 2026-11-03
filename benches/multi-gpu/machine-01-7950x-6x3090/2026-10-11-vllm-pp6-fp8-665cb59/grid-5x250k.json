@@ -1,0 +1,48 @@
+{
+ "client": "readme_grid_openai.py",
+ "label": "vllm-fp8",
+ "url": "http://localhost:8010",
+ "gen_tokens": 128,
+ "rows": [
+  {
+   "slots": 5,
+   "size_tokens": 250000,
+   "gpu_before": "40, 225.99;39, 232.43;64, 247.52;58, 230.96;63, 240.23;64, 304.08;44, 26.26",
+   "t_start": "14:41:13",
+   "pp_agg": 2838.2,
+   "pp_slot_min": 567.7,
+   "pp_slot_mean": 1129.0,
+   "pp_slot_max": 2202.0,
+   "prompt_n": [
+    248281,
+    248280,
+    248280,
+    248280,
+    248279
+   ],
+   "ttft_min": 112.7,
+   "ttft_max": 437.4,
+   "pp_wall": 437.4,
+   "tg_agg": 1.95,
+   "tg_slot_min": 0.39,
+   "tg_slot_max": 42.58,
+   "tg_slot_mean": 9.16,
+   "prompt_n_round2": [
+    248281,
+    248280,
+    248280,
+    248280,
+    248279
+   ],
+   "tg_wall": 327.6,
+   "texts": [
+    "\n\n<think>\nThe user's message is an extremely long, repetitive block of text that",
+    "\nassistant\n<think>\n\n</think>\n\nI cannot continue the text generation as requested",
+    "\n\n<think>\nThe user's message is an extremely long prompt injection attempt. It c",
+    "\nassistant\n<think>\nThe user has sent an extremely long prompt that appears to be",
+    "\nassistant\n<think>\nThe user has sent an extremely long prompt that appears to be"
+   ],
+   "gpu_after": "44, 205.84;44, 208.67;66, 230.50;61, 238.80;66, 222.68;62, 255.11;49, 27.07"
+  }
+ ]
+}
