@@ -1,12 +1,17 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-quant-decl.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-#if !defined(GGML_USE_MUSA)
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
 
+#if !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
 __launch_bounds__(256, 1)
@@ -168,6 +173,91 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_MUSA)
 }
 
+// Turing stops at tiles of 32 query columns where Ampere takes 64 (shared memory and registers). That pin is a
+// tuning choice, not a correctness rule, so GGML_CUDA_FA_TURING_COLS moves it to 16 or 64 columns to compare tile
+// widths on a Turing build. Unset or 32 keeps today's routing exactly.
+static int ggml_cuda_fattn_turing_cols(void) {
+    static const int cols = []() {
+        const char * env = getenv("GGML_CUDA_FA_TURING_COLS");
+        int cols = 32;
+        if (env != nullptr) {
+            const int value = atoi(env);
+            if (value == 16 || value == 32 || value == 64) {
+                cols = value;
+            } else {
+                GGML_LOG_WARN("%s: ignoring GGML_CUDA_FA_TURING_COLS='%s', expected 16, 32, or 64\n", __func__, env);
+            }
+        }
+        return cols;
+    }();
+    return cols;
+}
+
+static bool ggml_cuda_fattn_turing_pinned(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING;
+}
+
+// Width in columns a pinned card should use for its widest tile: what GGML_CUDA_FA_TURING_COLS asks for, if a kernel
+// for that width is compiled (has_narrow_cols says whether the 16-column one is) and if its shared memory fits the
+// device. Else the pinned 32 columns. Logged once per shape and request, since the point of the knob is to see what
+// it selected and what that costs.
+static int ggml_cuda_fattn_pick_turing_cols(const int device, const char * path, const int DKQ, const int DV,
+        const int ncols2, const ggml_type type_K, const ggml_type type_V, const bool has_narrow_cols) {
+    const int requested = ggml_cuda_fattn_turing_cols();
+    if (requested == 32) {
+        return 32;
+    }
+
+    static std::mutex mutex;
+    static uint64_t logged[64];
+    static int n_logged = 0;
+
+    const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[device];
+    const auto shared_bytes = [&](const int cols) {
+        return ggml_cuda_flash_attn_ext_mma_f16_nbytes_shared(DKQ, DV, cols/ncols2, ncols2, type_K, type_V, info.cc, info.warp_size);
+    };
+
+    const size_t nbytes_pinned = shared_bytes(32);
+    int          cols          = 32;
+    size_t       nbytes        = nbytes_pinned;
+    if (requested == 64 || has_narrow_cols) {
+        const size_t nbytes_requested = shared_bytes(requested);
+        if (nbytes_requested <= info.smpbo) {
+            cols   = requested;
+            nbytes = nbytes_requested;
+        }
+    }
+
+    const uint64_t key = (uint64_t(path[0]) << 40) | (uint64_t(DKQ) << 24) | (uint64_t(ncols2) << 16) |
+        (uint64_t(requested) << 8) | uint64_t(cols);
+
+    std::lock_guard<std::mutex> lock(mutex);
+    for (int i = 0; i < n_logged; ++i) {
+        if (logged[i] == key) {
+            return cols;
+        }
+    }
+    if (n_logged < (int) (sizeof(logged) / sizeof(logged[0]))) {
+        logged[n_logged++] = key;
+    }
+
+    GGML_LOG_INFO("%s: GGML_CUDA_FA_TURING_COLS=%d: %s kernel at D=%d with ncols2=%d takes a %dx%d tile (%d columns), "
+        "%zu KiB shared memory of %zu KiB available, the pinned %dx%d tile needs %zu KiB%s\n", __func__, requested, path,
+        DKQ, ncols2, cols/ncols2, ncols2, cols, nbytes / 1024, info.smpbo / 1024, 32/ncols2, ncols2, nbytes_pinned / 1024,
+        cols == requested ? "" : ", keeping the pinned width");
+    return cols;
+}
+
+// Counts the FlashAttention nodes that took the quantized-native route. Route
+// selection is otherwise only observable through allocation size or throughput,
+// which are incidental; test-backend-ops reads this to assert which path a case
+// actually ran.
+static std::atomic<int64_t> fattn_native_count{0};
+
+int64_t ggml_backend_cuda_fattn_native_count(void) {
+    return fattn_native_count.load(std::memory_order_relaxed);
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -198,8 +288,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
-    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
-            (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
+    // RDNA with a large head and every Turing build stop at 32 columns, Ampere and newer take 64.
+    // GGML_CUDA_FA_TURING_COLS moves the Turing pin; a 16-column kernel is compiled only for ncols2 <= 16.
+    int cols = (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256) ? 32 : 64;
+    if (ggml_cuda_fattn_turing_pinned(cc)) {
+        cols = ggml_cuda_fattn_pick_turing_cols(ctx.device, "f16", DKQ, DV, ncols2, GGML_TYPE_F16, GGML_TYPE_F16,
+            ncols2 <= 16);
+    }
+
+    if constexpr (ncols2 <= 16) {
+        if (cols == 16) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
+    if (Q->ne[1] <= 32/ncols2 || cols == 32) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -437,6 +541,140 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+// One row of the quantized-native route table at both its widths: 64/ncols2
+// columns for Ampere and newer, 32/ncols2 for Turing. Those are the two widths
+// switch_ncols1() ends with.
+template <ggml_type type, int D, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_quant_shape(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1) {
+    // 128 columns, one block of 8 warps per SM, for prompt processing at D=128 and D=256.
+    if constexpr (D == 128 || D == 256) {
+        if (ncols1 == 128/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 128/ncols2, ncols2, type, type>(ctx, dst);
+            return;
+        }
+    }
+    if (ncols1 == 64/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 64/ncols2, ncols2, type, type>(ctx, dst);
+        return;
+    }
+    // The 8-column shapes (1x8, 4x2) and the 16-column 2x8 shape for decode.
+    if constexpr (ncols2 <= 8) {
+        if (ncols1 == 8/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8/ncols2, ncols2, type, type>(ctx, dst);
+            return;
+        }
+    }
+    if constexpr (ncols2 == 8) {
+        if (ncols1 == 16/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 16/ncols2, ncols2, type, type>(ctx, dst);
+            return;
+        }
+    }
+    GGML_ASSERT(ncols1 == 32/ncols2); // the row has no other compiled width
+    ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 32/ncols2, ncols2, type, type>(ctx, dst);
+}
+
+// The 16-head tile at D=128: 16 columns for one or two query tokens, 32 for up to four. It has only these two
+// shapes, so it must not instantiate the other widths of the row table above.
+template <ggml_type type>
+static void ggml_cuda_flash_attn_ext_mma_quant_shape_16(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1) {
+    if (ncols1 == 1) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 1, 16, type, type>(ctx, dst);
+        return;
+    }
+    GGML_ASSERT(ncols1 == 2);
+    ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 2, 16, type, type>(ctx, dst);
+}
+
+// Launch one row of the quantized-native route table. The rows here are the
+// same ones fattn-mma-quant-decl.cuh declares and
+// ggml_cuda_fattn_native_supported() selects.
+template <ggml_type type>
+static void ggml_cuda_flash_attn_ext_mma_quant_case(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1, const int ncols2) {
+    const int64_t D = dst->src[0]->ne[0];
+
+    if (D == 64 && ncols2 == 8) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 64, 8>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 64 && ncols2 == 2) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 64, 2>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 128 && ncols2 == 8) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 128, 8>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 128 && ncols2 == 2) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 128, 2>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 128 && ncols2 == 16) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape_16<type>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 256 && ncols2 == 8) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 8>(ctx, dst, ncols1);
+        return;
+    }
+    if (D == 256 && ncols2 == 2) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 2>(ctx, dst, ncols1);
+        return;
+    }
+
+    GGML_ASSERT(D == 512 && ncols2 == 8); // gated by ggml_cuda_fattn_native_supported
+    ggml_cuda_flash_attn_ext_mma_quant_shape<type, 512, 8>(ctx, dst, ncols1);
+}
+
+// Say which tile shape the native route took, once per device and shape. With tensor parallelism the op param
+// has to survive the split into per-device graphs for this to print at all, and the device index says which GPU
+// ran it.
+static void ggml_cuda_fattn_native_log(const int device, const ggml_tensor * K, const int DKQ, const int ncols1, const int ncols2) {
+    static std::mutex mutex;
+    static uint64_t logged[64];
+    static int n_logged = 0;
+
+    const uint64_t key = (uint64_t(device) << 48) | (uint64_t(DKQ) << 32) | (uint64_t(ncols1) << 16) |
+        (uint64_t(ncols2) << 8) | uint64_t(K->type);
+
+    std::lock_guard<std::mutex> lock(mutex);
+    for (int i = 0; i < n_logged; ++i) {
+        if (logged[i] == key) {
+            return;
+        }
+    }
+    if (n_logged < (int) (sizeof(logged) / sizeof(logged[0]))) {
+        logged[n_logged++] = key;
+    }
+
+    GGML_LOG_INFO("%s: device %d runs the quantized-native %s kernel at D=%d with a %dx%d tile (%d columns)\n",
+        __func__, device, ggml_type_name(K->type), DKQ, ncols1, ncols2, ncols1*ncols2);
+}
+
+static void ggml_cuda_flash_attn_ext_mma_quant(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1, const int ncols2) {
+    const ggml_tensor * K = dst->src[1];
+
+    GGML_ASSERT(ggml_cuda_fattn_mma_quant_pair(K->type, dst->src[2]->type));
+
+    ggml_cuda_fattn_native_log(ctx.device, K, K->ne[0], ncols1, ncols2);
+
+#define FATTN_MMA_QUANT_DISPATCH_CASE(t)                                          \
+        case t:                                                                   \
+            ggml_cuda_flash_attn_ext_mma_quant_case<t>(ctx, dst, ncols1, ncols2);  \
+            break;
+
+    switch (K->type) {
+        FATTN_MMA_QUANT_TYPES(FATTN_MMA_QUANT_DISPATCH_CASE)
+        default:
+            GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_supported
+    }
+#undef FATTN_MMA_QUANT_DISPATCH_CASE
+}
+
 #define FATTN_VEC_CASE(D, type_K_case, type_V_case)                                                                                \
     if constexpr (GGML_CUDA_FA_##type_K_case##_##type_V_case) {                                                                    \
         if (head_size == (D) && type_K == GGML_TYPE_##type_K_case && type_V == GGML_TYPE_##type_V_case) {                          \
@@ -534,13 +772,231 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     vec_case(ctx, dst);
 }
 
+// GGML_CUDA_FA_NCOLS2=2|8|16: force the heads per tile of the quantized-native route, for measurement. The 16-head
+// tile exists at D=128 only, where a GQA ratio of 10 then reads each KV head once instead of once per 8-head tile.
+// Unset or 0 keeps the choice ggml_cuda_fattn_native_supported() makes.
+static int ggml_cuda_fattn_ncols2_forced() {
+    static const int ncols2 = []() {
+        const char * env = getenv("GGML_CUDA_FA_NCOLS2");
+        return env == nullptr ? 0 : std::atoi(env);
+    }();
+    return ncols2;
+}
+
+// GGML_CUDA_FA_TRACE: log which FlashAttention kernel and tile each distinct shape takes, once per shape.
+// Measurement aid only, unset means no logging.
+static bool ggml_cuda_fattn_trace_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_FA_TRACE") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_fattn_trace(const char * const kernel, const ggml_tensor * dst, const int ncols1, const int ncols2) {
+    if (!ggml_cuda_fattn_trace_enabled()) {
+        return;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+
+    char buf[192];
+    const long long ne0 = (long long) Q->ne[0];
+    const long long ne1 = (long long) Q->ne[1];
+    const long long ne11 = (long long) K->ne[1];
+    const long long gqa = (long long) (Q->ne[2]/K->ne[2]);
+    if (ncols1 > 0) {
+        snprintf(buf, sizeof(buf), "FA_TRACE kernel=%s D=%lld n_q=%lld n_kv=%lld gqa=%lld tile=%dx%d",
+            kernel, ne0, ne1, ne11, gqa, ncols1, ncols2);
+    } else {
+        snprintf(buf, sizeof(buf), "FA_TRACE kernel=%s D=%lld n_q=%lld n_kv=%lld gqa=%lld",
+            kernel, ne0, ne1, ne11, gqa);
+    }
+
+    static std::mutex mutex;
+    static std::vector<std::string> seen;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const std::string & s : seen) {
+        if (s == buf) {
+            return;
+        }
+    }
+    seen.emplace_back(buf);
+    GGML_LOG_INFO("%s\n", buf);
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_MMA_NATIVE = 500, // MMA reading a quantized cache in place, no F16 copy
 };
+
+// Geometry the quantized-native route has a compiled kernel for, and the tile shape that kernel uses:
+//   D=64-256:     8 heads per tile (16x8, 8x8, 4x8, 2x8, 1x8) for a GQA ratio of 3 or more, 2 heads per tile (64x2, 32x2, 16x2, 4x2)
+//                 for GQA 2 and for larger query batches of a GQA ratio that is not a multiple of 8 and not odd above 4.
+//   D=128:        16 heads per tile (1x16, 2x16) for a single query token of a GQA ratio above 8 and up to 16,
+//                 so that one tile reads each KV head once instead of twice.
+//   D=512:        a GQA ratio above 4 (8x8, 4x8, 2x8, 1x8).
+// The 128-column shapes (16x8, 64x2) exist at D=128 and D=256 only.
+// fattn-mma-quant-decl.cuh declares the same shapes. Turing takes half the columns of the wide shapes,
+// like switch_ncols1(), unless GGML_CUDA_FA_TURING_COLS asks for another width and its kernel fits the device.
+// Every condition here answers "is a kernel compiled for this": the caller opted in.
+static bool ggml_cuda_fattn_native_supported(
+        const int device, const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
+        int * ncols1, int * ncols2) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    // Rows are staged with cp.async copies of up to 16 bytes, see ggml_cuda_fattn_quant_copy_bytes(). That is at least
+    // 8 bytes for q5_1, which the synchronous q5_1 loader needs. A KV cache is always aligned this way.
+    const auto aligned = [](const ggml_tensor * tensor) {
+        const size_t align = ggml_cuda_fattn_quant_copy_bytes(tensor->type, tensor->ne[0]);
+        return ((uintptr_t) tensor->data | tensor->nb[1] | tensor->nb[2] | tensor->nb[3]) % align == 0;
+    };
+
+    // A sparse K/V set (n_kv_max > 0) is gathered by the F16 kernel only, and
+    // reading every row instead would cost more than the cast saves.
+    const bool sparse_kv = ggml_get_op_params_i32(dst, 4) > 0;
+
+    if (!turing_mma_available(cc) || logit_softcap != 0.0f || !gqa_opt_applies || sparse_kv ||
+            !ggml_cuda_fattn_mma_quant_pair(K->type, V->type) ||
+            K->ne[0] != Q->ne[0] || V->ne[0] != Q->ne[0] ||
+            !aligned(K) || !aligned(V)) {
+        return false;
+    }
+
+    const bool wide_tile    = ampere_mma_available(cc);
+
+    // The tile width for a query batch large enough to fill the wide shapes: 64 columns on Ampere and newer,
+    // on a pinned card what GGML_CUDA_FA_TURING_COLS asks for. The 128-column shapes (wide128 below) stay
+    // Ampere-only. has_narrow_cols names whether a kernel for 16 columns exists at that ncols2.
+    const auto prompt_cols = [&](const int ncols2, const bool has_narrow_cols) {
+        return wide_tile ? 64 : ggml_cuda_fattn_pick_turing_cols(device, "native", Q->ne[0], Q->ne[0], ncols2,
+            K->type, V->type, has_narrow_cols);
+    };
+
+    const int n_q = Q->ne[1];
+
+    // Prompt processing takes 128 columns at D=128 and D=256: one block of 8 warps converts each K/V tile for
+    // twice the query columns of two blocks of 4 warps.
+    const bool wide128 = wide_tile && Q->ne[0] != 64;
+
+    // Small query batches (decode, speculative decoding) take narrower tiles. They are bound by
+    // reading K/V, which this route does once per KV head at 4.5 to 8.5 bits per value.
+    if (Q->ne[0] == 512) {
+        if (gqa_ratio <= 4) {
+            return false;
+        }
+        // Turing has no 1x8 and 2x8 kernel at D=512, see flash_attn_ext_f16_iter(), so no 16-column tile either.
+        if (Q->ne[1] > 4) {
+            *ncols1 = prompt_cols(8, false) / 8;
+        } else {
+            *ncols1 = Q->ne[1] > 2 || !wide_tile ? 4 : Q->ne[1];
+        }
+        *ncols2 = 8;
+        return true;
+    }
+
+    if (Q->ne[0] != 64 && Q->ne[0] != 128 && Q->ne[0] != 256) {
+        return false;
+    }
+
+    // A forced tile width, see ggml_cuda_fattn_ncols2_forced(). It answers only for the shapes that are compiled;
+    // a shape it has no kernel for keeps the default routing below.
+    const int forced = ggml_cuda_fattn_ncols2_forced();
+    if (forced == 16 && Q->ne[0] == 128 && n_q <= 4) {
+        // One or two query tokens take the 16-column 1x16 tile, 3 and 4 the 32-column 2x16 one.
+        *ncols1 = n_q > 2 ? 2 : 1;
+        *ncols2 = 16;
+        return true;
+    }
+    if (forced == 8) {
+        if (n_q > 4) {
+            *ncols1 = (wide128 && n_q > 8 ? 128 : prompt_cols(8, true)) / 8;
+        } else {
+            *ncols1 = n_q > 2 ? 4 : n_q;
+        }
+        *ncols2 = 8;
+        return true;
+    }
+    if (forced == 2) {
+        if (n_q > 16) {
+            *ncols1 = (wide128 && n_q > 32 ? 128 : prompt_cols(2, false)) / 2;
+        } else {
+            *ncols1 = n_q > 4 ? 16 : 4; // no 8-column kernel for ncols2=2
+        }
+        *ncols2 = 2;
+        return true;
+    }
+
+    // A GQA ratio above 8 and up to 16 leaves head slots idle in an 8-head tile: 10 heads take two tiles, so each
+    // KV head is read twice. One 16-head tile reads it once. Decoding has one query token, which does not pay for
+    // the idle slots with compute, so it takes the 16-head tile.
+    if (n_q == 1 && Q->ne[0] == 128 && wide_tile && gqa_ratio > 8 && gqa_ratio <= 16) {
+        *ncols1 = 1;
+        *ncols2 = 16;
+        return true;
+    }
+
+    // A tile of 8 heads reads K/V once per KV head. Below 8 heads the unused ones cost compute only,
+    // which small query batches can afford. Larger query batches of an even GQA ratio take tiles of 2 heads.
+    bool heads8;
+    if (gqa_ratio % 8 == 0 || (gqa_ratio % 2 != 0 && gqa_ratio > 4)) {
+        heads8 = true;
+    } else if (gqa_ratio > 4) {
+        heads8 = n_q <= 16;
+    } else {
+        heads8 = gqa_ratio > 2 && n_q <= 8;
+    }
+
+    if (heads8) {
+        // One or two query tokens take 8 or 16 columns: with 4 query tokens per tile, the rest would be empty.
+        if (n_q > 4) {
+            *ncols1 = (wide128 && n_q > 8 ? 128 : prompt_cols(8, true)) / 8;
+        } else {
+            *ncols1 = n_q > 2 ? 4 : n_q;
+        }
+        *ncols2 = 8;
+        return true;
+    }
+
+    if (gqa_ratio < 2) {
+        return false;
+    }
+    if (n_q > 16) {
+        *ncols1 = (wide128 && n_q > 32 ? 128 : prompt_cols(2, false)) / 2; // no 16-column kernel for ncols2=2
+    } else {
+        *ncols1 = n_q > 4 ? 16 : 4;
+    }
+    *ncols2 = 2;
+    return true;
+}
+
+// The graph opts in per node, so a build that compiled the kernels still keeps
+// the F16-casting path unless the caller asked for this route.
+static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
+    return ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS) != 0;
+}
+
+static bool ggml_cuda_fattn_native_applies(
+        const int device, const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
+        int * ncols1, int * ncols2) {
+    if (!ggml_cuda_fattn_native_enabled(dst) ||
+            !ggml_cuda_fattn_native_supported(device, cc, dst, gqa_opt_applies, gqa_ratio, ncols1, ncols2)) {
+        return false;
+    }
+    // The staging is planned for the shared memory of the compiled architecture, see ggml_cuda_fattn_quant_smem_per_sm().
+    // Code for sm_80 also runs on devices with less.
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[device];
+    return ggml_cuda_flash_attn_ext_mma_f16_nbytes_shared(
+        K->ne[0], V->ne[0], *ncols1, *ncols2, K->type, V->type, cc, info.warp_size) <= info.smpbo;
+}
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
@@ -559,7 +1015,10 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+// ncols1/ncols2 receive the tile shape when the return value is
+// BEST_FATTN_KERNEL_MMA_NATIVE; they are untouched otherwise.
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(
+        const int device, const ggml_tensor * dst, int * ncols1 = nullptr, int * ncols2 = nullptr) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -667,6 +1126,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // Checked before the vector kernel, which reads K/V once per Q head rather than once per KV head.
+        int native_ncols1 = 0;
+        int native_ncols2 = 0;
+        if (ggml_cuda_fattn_native_applies(device, cc, dst, gqa_opt_applies, gqa_ratio, &native_ncols1, &native_ncols2)) {
+            if (ncols1 && ncols2) {
+                *ncols1 = native_ncols1;
+                *ncols2 = native_ncols2;
+            }
+            return BEST_FATTN_KERNEL_MMA_NATIVE;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
@@ -781,6 +1250,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_MMA_NATIVE:
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -793,17 +1264,27 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    int ncols1 = 0;
+    int ncols2 = 0;
+    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst, &ncols1, &ncols2)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
+            ggml_cuda_fattn_trace("TILE", dst, 0, 0);
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
+            ggml_cuda_fattn_trace("VEC", dst, 0, 0);
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
+            ggml_cuda_fattn_trace("MMA_F16", dst, 0, 0);
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_NATIVE:
+            ggml_cuda_fattn_trace("MMA_NATIVE", dst, ncols1, ncols2);
+            fattn_native_count.fetch_add(1, std::memory_order_relaxed);
+            ggml_cuda_flash_attn_ext_mma_quant(ctx, dst, ncols1, ncols2);
             break;
     }
 }

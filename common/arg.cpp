@@ -1680,6 +1680,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--flash-attn-native-quants"},
+        {"--no-flash-attn-native-quants"},
+        "read quantized K/V caches directly in the CUDA MMA FlashAttention kernel instead of casting them to F16 "
+        "first, which removes the transient F16 copy of the attention window. Results differ from the F16 path "
+        "in rounding only. Applies only where a native kernel exists for the cache type, head dimension and GQA "
+        "ratio; other cases keep the F16 path (default: disabled)",
+        [](common_params & params, bool value) {
+            params.flash_attn_native_quants = value;
+        }
+    ).set_env("LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS"));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

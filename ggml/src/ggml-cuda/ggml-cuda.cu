@@ -376,6 +376,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       device_vram_mib);
         std::string device_name(prop.name);
+        info.devices[id].mma_f32_acc_half_rate = device_name.find("GeForce") != std::string::npos;
         if (device_name == "NVIDIA GeForce MX450") {
             turing_devices_without_mma.push_back({ id, device_name });
         } else if (device_name == "NVIDIA GeForce MX550") {
@@ -6555,6 +6556,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fattn_native_count") == 0) {
+        return (void *)ggml_backend_cuda_fattn_native_count;
     }
     return nullptr;
 }
