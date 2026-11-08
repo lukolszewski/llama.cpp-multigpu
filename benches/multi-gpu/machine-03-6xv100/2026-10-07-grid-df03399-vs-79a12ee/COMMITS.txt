@@ -1,0 +1,3 @@
+multigpu commit: 79a12ee4767da375c7deb66355149d6b1adc84b7 (image cuda-12.9, CUDA 12.9.1, SASS sm_70,sm_86,sm_89,sm_120a,sm_121a, PTX sm_50,sm_61,sm_70,sm_75,sm_80,sm_90)
+upstream base:   df03399b885831b2a1603b3abb0d8c156808e363
+upstream binary: version: 0.4.0-dev (build 10902, commit df03399b8) built with GNU 13.3.0 for Linux x86_64  from https://github.com/lukolszewski/llama.cpp-multigpu/releases/download/baseline-df03399/llama.cpp-upstream-df03399-bin-ubuntu-cuda-12.9-x64.tar.gz

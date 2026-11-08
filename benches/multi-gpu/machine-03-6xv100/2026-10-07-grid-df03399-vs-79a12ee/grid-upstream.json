@@ -1,0 +1,91 @@
+{
+ "label": "upstream",
+ "url": "http://127.0.0.1:8009",
+ "gen_tokens": 128,
+ "rows": [
+  {
+   "slots": 1,
+   "size_tokens": 5000,
+   "gpu_before": "39, 71.58;46, 72.12;46, 72.12;40, 70.06;39, 67.59;45, 73.55;39, 44.53;35, 41.54",
+   "t_start": "15:24:42",
+   "pp_agg": 395.6,
+   "pp_slot_min": 397.6,
+   "pp_slot_mean": 397.6,
+   "pp_slot_max": 397.6,
+   "prompt_n": [
+    4990
+   ],
+   "ttft_min": 12.6,
+   "ttft_max": 12.6,
+   "pp_wall": 12.6,
+   "tg_agg": 32.56,
+   "tg_slot_min": 34.18,
+   "tg_slot_mean": 34.18,
+   "tg_slot_max": 34.18,
+   "prompt_n_round2": [
+    4
+   ],
+   "tg_wall": 3.9,
+   "texts": [
+    "\n\n<think>\n\n</think>\n\nThe system hums with a low-frequency vibration, a digital r"
+   ],
+   "gpu_after": "39, 59.30;46, 59.30;46, 60.32;40, 58.27;40, 57.25;46, 60.78;39, 44.53;35, 41.54"
+  },
+  {
+   "slots": 1,
+   "size_tokens": 50000,
+   "gpu_before": "39, 59.79;46, 59.30;46, 60.32;40, 58.27;39, 56.76;46, 60.78;39, 44.53;35, 41.54",
+   "t_start": "15:24:58",
+   "pp_agg": 314.9,
+   "pp_slot_min": 315.9,
+   "pp_slot_mean": 315.9,
+   "pp_slot_max": 315.9,
+   "prompt_n": [
+    49676
+   ],
+   "ttft_min": 157.8,
+   "ttft_max": 157.8,
+   "pp_wall": 157.8,
+   "tg_agg": 22.04,
+   "tg_slot_min": 23.63,
+   "tg_slot_mean": 23.63,
+   "tg_slot_max": 23.63,
+   "prompt_n_round2": [
+    4
+   ],
+   "tg_wall": 5.8,
+   "texts": [
+    "\n\n<think>\nThe user's message is an extremely long, repetitive block of text that"
+   ],
+   "gpu_after": "41, 60.28;48, 60.28;48, 60.82;42, 58.27;41, 57.25;48, 61.27;39, 44.53;36, 41.54"
+  },
+  {
+   "slots": 1,
+   "size_tokens": 150000,
+   "gpu_before": "41, 60.28;47, 59.79;47, 60.82;42, 58.27;41, 56.76;48, 61.27;39, 44.53;36, 41.54",
+   "t_start": "15:27:42",
+   "pp_agg": 226.6,
+   "pp_slot_min": 227.1,
+   "pp_slot_mean": 227.1,
+   "pp_slot_max": 227.1,
+   "prompt_n": [
+    148976
+   ],
+   "ttft_min": 657.3,
+   "ttft_max": 657.3,
+   "pp_wall": 657.3,
+   "tg_agg": 13.36,
+   "tg_slot_min": 14.61,
+   "tg_slot_mean": 14.61,
+   "tg_slot_max": 14.61,
+   "prompt_n_round2": [
+    4
+   ],
+   "tg_wall": 9.6,
+   "texts": [
+    "\n\n<think>\n\n</think>\n\nThe system has entered a state of recursive saturation, whe"
+   ],
+   "gpu_after": "42, 75.52;50, 77.54;49, 61.31;43, 74.00;43, 71.49;50, 78.48;39, 44.53;36, 41.54"
+  }
+ ]
+}

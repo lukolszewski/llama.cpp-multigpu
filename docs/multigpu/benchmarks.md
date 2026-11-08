@@ -292,6 +292,42 @@ raw data:         benches/multi-gpu/machine-02-6x4090/2026-10-06-grid-df03399-vs
 | 5 slots - concurrent - prefill | 250k | not run | 7241 (6836/slot) | n/a |
 | 5 slots - concurrent - generate | 250k | not run | 101.1 (30.8/slot) | n/a |
 
+### machine-03-6xv100 (rented, Vast.ai)
+
+```
+multigpu commit:  79a12ee4767da375c7deb66355149d6b1adc84b7  (image cuda-12.9, CUDA 12.9.1; SASS sm_70,sm_86,sm_89,sm_120a,sm_121a; PTX sm_50,sm_61,sm_70,sm_75,sm_80,sm_90)
+upstream base:   df03399b885831b2a1603b3abb0d8c156808e363
+upstream binary: version: 0.4.0-dev (build 10902, commit df03399b8) built with GNU 13.3.0 for Linux x86_64  from https://github.com/lukolszewski/llama.cpp-multigpu/releases/download/baseline-df03399/llama.cpp-upstream-df03399-bin-ubuntu-cuda-12.9-x64.tar.gz
+machine:          8 x Tesla V100-SXM2-32GB (256 GB aggregate), GPUs used: 0,1,2,3,4,5 (6 of 8), driver 580.173.02 (CUDA 13.0), CPU Intel(R) Xeon(R) Gold 6248 CPU @ 2.50GHz, RAM 754.5 GiB; record: benches/multi-gpu/machine-03-6xv100/hardware.md
+server:           -c 1310720 --parallel 5 -fa on --cache-type-k/v q8_0 -b 2048 -ub 512 --tensor-split 0.89,1,1,1,1,1 (patched adds --prefill-max-partial 2 and LLAMA_DECODE_PIPELINE=1 LLAMA_SERVER_GROUPS=5 LLAMA_PIPELINE_PARALLEL=1 GGML_CUDA_GRAPHS_FORCE=1 LLAMA_ATTN_ROT_DISABLE=1; speculation off)
+grid:             slots 1,5, sizes 5000,50000,150000,200000,250000 (5 sessions: 5000,50000 only; V100 prefill too slow for the deep 5-session rows within budget); upstream slots 1, sizes 5000,50000,150000; same protocol and scripts as machine-01
+measured:         2026-10-07; upstream df03399b8 (same cuda-12.9 recipe, baseline prerelease)
+raw data:         benches/multi-gpu/machine-03-6xv100/2026-10-07-grid-df03399-vs-79a12ee/
+```
+
+| Workload | Context | Upstream llama.cpp | llama.cpp-multigpu | Improvement |
+| --- | --- | --- | --- | --- |
+| 1 slot - prefill | 5k | 398 | 390 | 0.98x (-7 t/s) |
+| 1 slot - generate | 5k | 34.2 | 37.6 | 1.10x (+3.4 t/s) |
+| 1 slot - prefill | 50k | 316 | 348 | 1.10x (+32 t/s) |
+| 1 slot - generate | 50k | 23.6 | 31.7 | 1.34x (+8.1 t/s) |
+| 1 slot - prefill | 150k | 227 | 263 | 1.16x (+36 t/s) |
+| 1 slot - generate | 150k | 14.6 | 27.2 | 1.86x (+12.6 t/s) |
+| 1 slot - prefill | 200k | not run | 238 | n/a |
+| 1 slot - generate | 200k | not run | 26.0 | n/a |
+| 1 slot - prefill | 250k | not run | 217 | n/a |
+| 1 slot - generate | 250k | not run | 25.6 | n/a |
+| 5 slots - concurrent - prefill | 5k | not run | 382 (165/slot) | n/a |
+| 5 slots - concurrent - generate | 5k | not run | 149.7 (35.4/slot) | n/a |
+| 5 slots - concurrent - prefill | 50k | not run | 331 (246/slot) | n/a |
+| 5 slots - concurrent - generate | 50k | not run | 122.3 (30.5/slot) | n/a |
+| 5 slots - concurrent - prefill | 150k | not run | not run | n/a |
+| 5 slots - concurrent - generate | 150k | not run | not run | n/a |
+| 5 slots - concurrent - prefill | 200k | not run | not run | n/a |
+| 5 slots - concurrent - generate | 200k | not run | not run | n/a |
+| 5 slots - concurrent - prefill | 250k | not run | not run | n/a |
+| 5 slots - concurrent - generate | 250k | not run | not run | n/a |
+
 ---
 
 ## Mixed workload behavior
